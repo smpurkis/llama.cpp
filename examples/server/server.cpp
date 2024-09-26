@@ -6,6 +6,8 @@
 #include "sampling.h"
 #include "json-schema-to-grammar.h"
 #include "llama.h"
+#include <jinja2cpp/template.h>
+#include <jinja2cpp/reflected_value.h>
 
 // Change JSON_ASSERT from assert() to GGML_ASSERT:
 #define JSON_ASSERT GGML_ASSERT
@@ -913,17 +915,197 @@ struct server_context {
             send_error(task, "Either \"json_schema\" or \"grammar\" can be specified, but not both", ERROR_TYPE_INVALID_REQUEST);
             return false;
         }
-        if (data.contains("json_schema") && !data.contains("grammar")) {
-            try {
-                auto schema                = json_value(data, "json_schema", json::object());
-                slot.sparams.grammar       = json_schema_to_grammar(schema);
-            } catch (const std::exception & e) {
-                send_error(task, std::string("\"json_schema\": ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
-                return false;
-            }
-        } else {
-            slot.sparams.grammar       = json_value(data, "grammar",           default_sparams.grammar);
-        }
+
+//         std::string template_key = "tokenizer.chat_template";
+//         std::string model_template;
+//         int32_t tlen = llama_model_meta_val_str(model, template_key.c_str(), nullptr, 0);
+//         if (tlen > 0) {
+//             std::vector<char> curr_tmpl_buf(tlen + 1, 0);
+//             if (llama_model_meta_val_str(model, template_key.c_str(), curr_tmpl_buf.data(), curr_tmpl_buf.size()) == tlen) {
+//                 model_template = std::string(curr_tmpl_buf.data(), tlen);
+//             }
+//         }
+//         std::cout << "Model template: " << model_template << "\n\n";
+
+//         std::cout << "Prompt: " << data.find("prompt")->get<std::string>() << "\n\n";
+
+//         auto messages = json_value(data, "messages", json::array());
+//         std::cout << "Messages: " << messages << "\n\n";
+
+//         auto tools = json_value(data, "tools", json::object());
+//         std::cout << "Tools: " << tools << "\n\n";
+
+//         auto tool_choice = data.value("tool_choice", "");
+//         std::cout << "tool_choice: " << tool_choice << "\n\n";
+
+//         // std::string chatml_tools_template = R"(
+//         // {%- if messages[0]['role'] == 'system' %}
+//         //     {{- '<|im_start|>system\n' + messages[0]['content'] + '<|im_end|>\n' }}
+//         // {%- else %}
+//         //     {{- '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n' }}
+//         // {%- endif %}
+//         // {%- for message in messages %}
+//         //     {%- if message.role == "user" or message.role == "assistant" %}
+//         //         {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>\n' }}
+//         //     {%- endif %}
+//         // {%- endfor %}
+//         // )";
+
+//         std::string chatml_tools_template = R"(
+// {% for message in messages %}<|im_start|>{{ message.role }}
+// {% if message.role == 'system' %}{{ message.content }}{% if tool_calls %}
+// You have access to the following functions:
+// {% for tool in tools %}
+// functions.{{ tool.function.name }}:
+// {{ tool.function.parameters | tojson }}
+// {% endfor %}
+// You can respond to users messages with either a single message or one or more function calls.
+// To respond with a message begin the message with 'message:', use the following format:
+// message:
+// <message>
+// To respond with one or more function calls begin the message with 'functions.<function_name>:', use the following format:
+// functions.<function_name>:
+// { "arg1": "value1", "arg2": "value2" }'
+// functions.<function_name>:
+// { "arg1": "value1", "arg2": "value2" }'
+// {% endif %}<|im_end|>
+// {% endif %}
+// {% if message.role == 'user' %}{{ message.content }}<|im_end|>
+// {% endif %}
+// {% if message.role == 'assistant' %}{% if message.content and message.content | length > 0 %}{% if tool_calls %}message:{% endif %}{{ message.content }}<|im_end|>{% endif %}{% if 'tool_calls' in message %}{% for tool_call in message.tool_calls %}functions.{{ tool_call.function.name }}:{{ tool_call.function.arguments }}{% endfor %}<|im_end|>{% endif %}{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant{% endif %}
+// )";
+
+//         // Create a jinja2cpp::Template object
+//         jinja2::Template tpl;
+//         tpl.Load(chatml_tools_template);
+
+//         // Create a ValuesMap to hold the data for the template
+//         jinja2::ValuesMap params;
+//         jinja2::ValuesList messagesList;
+//         for (const auto& msg : messages) {
+//             jinja2::ValuesMap messageMap;
+//             messageMap["role"] = jinja2::Value(msg.value("role", "user"));
+//             messageMap["content"] = jinja2::Value(msg.value("content", ""));
+//             messagesList.push_back(messageMap);
+//         }
+
+//         /*[
+//   {
+//     "type": "function",
+//     "function": {
+//       "name": "get_delivery_date",
+//       "description": "Get the delivery date for a customer's order. Call this whenever you need to know the delivery date, for example when a customer asks 'Where is my package'",
+//       "parameters": {
+//         "type": "object",
+//         "properties": {
+//           "order_id": {
+//             "type": "string",
+//             "description": "The customer's order ID."
+//           }
+//         },
+//         "required": [
+//           "order_id"
+//         ],
+//         "additionalProperties": false
+//       }
+//     }
+//   }
+// ]*/
+//         params["messages"] = messagesList;
+//         jinja2::ValuesList toolsList = jinja2::ValuesList();
+//         for (const auto& [name, tool] : tools.items()) {
+//             json functionJson = tool.value("function", json::object());
+//             json parametersJson = functionJson.value("parameters", json::object());
+//             json propertiesJson = parametersJson.value("properties", json::object());
+
+//             jinja2::ValuesMap propertiesMap = jinja2::ValuesMap();
+//             for (const auto& [propName, prop] : propertiesJson.items()) {
+//                 jinja2::ValuesMap propMap = jinja2::ValuesMap();
+//                 propMap["type"] = jinja2::Value(prop.value("type", "string"));
+//                 propMap["description"] = jinja2::Value(prop.value("description", ""));
+//                 propertiesMap[propName] = propMap;
+//             }
+
+//             jinja2::ValuesMap parametersMap = jinja2::ValuesMap();
+//             parametersMap["type"] = jinja2::Value(parametersJson.value("type", "object"));
+//             parametersMap["properties"] = propertiesMap;
+//             parametersMap["additionalProperties"] = jinja2::Value(parametersJson.value("additionalProperties", false));
+
+//             jinja2::ValuesMap functionMap = jinja2::ValuesMap();
+//             functionMap["name"] = jinja2::Value(functionJson.value("name", ""));
+//             functionMap["description"] = jinja2::Value(functionJson.value("description", ""));
+//             functionMap["parameters"] = parametersMap;
+            
+//             jinja2::ValuesMap toolMap = jinja2::ValuesMap();
+//             toolMap["type"] = jinja2::Value(tool.value("type", "function"));
+//             toolMap["function"] = functionMap;
+//             toolsList.push_back(toolMap);
+//         }
+//         params["tools"] = toolsList;
+//         params["tool_calls"] = toolsList.size() > 0;
+
+//         // Render the template
+//         std::string result = tpl.RenderAsString(params).value();
+//         std::cout << "Result: " << result << "\n\n";
+        
+        
+//         std::string tool;
+//         json parameters_json_schema = nullptr;
+//         for (auto& tool : tools) {
+//             std::cout << "tool name: " << tool["function"]["name"] << " tool_choice:  " << tool_choice << "\n\n";
+//             if (tool["function"]["name"] == tool_choice) {
+//                 parameters_json_schema = tool["function"]["parameters"];
+//                 std::cout << "Parameters JSON Schema: " << parameters_json_schema << "\n\n";
+//                 break;
+//             }
+//         }
+
+//         if (parameters_json_schema == nullptr) {
+//             slot.sparams.grammar = json_schema_to_grammar(parameters_json_schema);
+//         } else {
+//             slot.sparams.grammar = R"(
+// root   ::= object
+// value  ::= object | array | string | number | ("true" | "false" | "null") ws
+
+// object ::=
+//   "{" ws (
+//             string ":" ws value
+//     ("," ws string ":" ws value)*
+//   )? "}" ws
+
+// array  ::=
+//   "[" ws (
+//             value
+//     ("," ws value)*
+//   )? "]" ws
+
+// string ::=
+//   "\"" (
+//     [^"\\\x7F\x00-\x1F] |
+//     "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4}) # escapes
+//   )* "\"" ws
+
+// number ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ("." [0-9]+)? ([eE] [-+]? [0-9] [1-9]{0,15})? ws
+
+// # Optional space: by convention, applied in this grammar after literal chars when allowed
+// ws ::= | " " | "\n" [ \t]{0,20}
+//             )";
+//         }
+        
+//         std::cout << "Grammar: " << slot.sparams.grammar << "\n\n";
+//         slot.prompt = result;
+        
+//         // if (data.contains("json_schema") && !data.contains("grammar")) {
+//         //     try {
+//         //         auto schema                = json_value(data, "json_schema", json::object());
+//         //         slot.sparams.grammar       = json_schema_to_grammar(schema);
+//         //     } catch (const std::exception & e) {
+//         //         send_error(task, std::string("\"json_schema\": ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
+//         //         return false;
+//         //     }
+//         // } else {
+//         //     slot.sparams.grammar       = json_value(data, "grammar",           default_sparams.grammar);
+//         // }
 
         if (slot.params.cache_prompt && slot.ga_n != 1) {
             slot.params.cache_prompt = false;
@@ -2852,6 +3034,10 @@ int main(int argc, char ** argv) {
             res_error(res, format_error_response("This server does not support completions. Start it without `--embeddings`", ERROR_TYPE_NOT_SUPPORTED));
             return;
         }
+
+        jinja2::Template tpl; 
+        tpl.Load("{{ 'Hello World' }}!!!");
+        std::cout << tpl.RenderAsString({}).value() << std::endl;
 
         json data = oaicompat_completion_params_parse(ctx_server.model, json::parse(req.body), params.chat_template);
 

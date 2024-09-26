@@ -1,8 +1,20 @@
+cmake_minimum_required(VERSION 3.15)  # Adjust minimum CMake version if needed
+
 set(TARGET llama-server)
 
 option(LLAMA_SERVER_SSL "Build SSL support for the server" OFF)
 
-include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
+include(FetchContent)
+
+# Fetch Jinja2Cpp using FetchContent
+FetchContent_Declare(
+    jinja2cpp
+    GIT_REPOSITORY https://github.com/jinja2cpp/Jinja2Cpp.git
+    GIT_TAG 1.3.2  # Replace with desired Jinja2Cpp version
+)
+FetchContent_MakeAvailable(jinja2cpp)
+
+include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR} ${jinja2cpp_INCLUDE_DIRS})
 
 if (MINGW)
     # fix: https://github.com/ggerganov/llama.cpp/actions/runs/9651004652/job/26617901362?pr=8006
@@ -47,7 +59,7 @@ endforeach()
 add_executable(${TARGET} ${TARGET_SRCS})
 install(TARGETS ${TARGET} RUNTIME)
 
-target_link_libraries(${TARGET} PRIVATE common ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PRIVATE common ${CMAKE_THREAD_LIBS_INIT} jinja2cpp)
 
 if (LLAMA_SERVER_SSL)
     find_package(OpenSSL REQUIRED)
