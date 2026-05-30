@@ -690,11 +690,14 @@ uint64_t kv_ssd_find_match(kv_ssd_cache* cache,
                            const uint32_t* tokens, size_t tokens_size,
                            uint32_t current_turn,
                            uint64_t max_n_tokens,
-                           int32_t n_past)
+                           int32_t n_past,
+                           int32_t* out_lcp)
 {
     (void)current_turn;  // unused - was for cross-conversation matching
     (void)n_past;        // unused - was for tiered search
     if (!cache || !cache->initialized || !tokens || tokens_size == 0) return 0;
+
+    if (out_lcp) *out_lcp = 0;
 
     std::lock_guard<std::mutex> lock(cache->mutex);
 
@@ -738,6 +741,7 @@ uint64_t kv_ssd_find_match(kv_ssd_cache* cache,
                 (unsigned long)best_id, (unsigned long)cache->conv_hash,
                 best_turn, (unsigned long)ntok, best_lcp);
     }
+    if (best_id != 0 && out_lcp) *out_lcp = best_lcp;
 
     return best_id;
 }

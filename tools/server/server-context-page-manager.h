@@ -128,7 +128,8 @@ public:
         uint64_t& out_n_tokens,
         uint64_t conv_hash = 0,
         int32_t n_past = -1,
-        uint64_t max_n_tokens = UINT64_MAX
+        uint64_t max_n_tokens = UINT64_MAX,
+        int32_t* out_lcp = nullptr
     );
 
     // Evict all checkpoints for a specific slot

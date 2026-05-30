@@ -3097,17 +3097,10 @@ private:
                     }
 
                        // Cold-start: try SSD cache when prompt cache is empty (n_past == 0)
-                       // For hybrid models, skip SSD checkpoint restore on cold start.
-                       // The recurrent state is content-dependent - restoring a checkpoint
-                       // from a different conversation (conv_hash collision from shared
-                       // system prompt) produces wrong recurrent state, causing all -inf
-                       // logits and a sampler assertion crash.
                        if (n_past == 0 && ssd_page_manager && slot.task) {
-                           if (is_hybrid) {
-                               LOG_WRN("cold-start: skipping SSD checkpoint restore for hybrid model (recurrent state is content-dependent)\n");
-                           } else {
                            int32_t ssd_pos_min = 0, ssd_pos_max = 0;
                            uint64_t ssd_n_tokens = 0;
+                           int32_t ssd_lcp = 0;
 
                             // Compute conversation hash: first 1024 task tokens
                             // (stable across turns - matches checkpoint storage)
@@ -3122,7 +3115,8 @@ private:
                                     ssd_turn_counter, ctx_tgt,
                                     ssd_pos_min, ssd_pos_max, ssd_n_tokens,
                                     conv_hash, n_past,
-                                    (uint64_t)slot.task->n_tokens())) {
+                                    (uint64_t)slot.task->n_tokens(),
+                                    &ssd_lcp)) {
 
                                 // Populate prompt tokens from task so keep_first/pos_next work
                                 slot.prompt.tokens.clear();
@@ -3130,6 +3124,39 @@ private:
 
                                 n_past = std::min((int)slot.prompt.tokens.size(), (int)ssd_n_tokens);
 
+                                // For hybrid models, validate that the LCP covers most of
+                                // the checkpoint. The recurrent state is content-dependent -
+                                // if the LCP is much smaller than the checkpoint's n_tokens,
+                                // the recurrent state beyond the LCP is from a different
+                               // conversation and will produce garbage logits.
+                               if (is_hybrid && ssd_lcp > 0 && ssd_n_tokens > 0) {
+                                   // The token prefix stored with each checkpoint is capped at
+                                   // KV_SSD_TOKEN_PREFIX_MAX (4096). We can only validate the LCP
+                                   // against what was actually stored. For same-conversation
+                                   // checkpoints (found via find_continuation), the recurrent
+                                   // state beyond the prefix is valid because the conversation
+                                   // only grew by appending tokens.
+                                   const uint64_t validated_tokens = std::min(ssd_n_tokens, (uint64_t)KV_SSD_TOKEN_PREFIX_MAX);
+                                   const float MIN_LCP_RATIO = 0.80f;
+                                   float lcp_ratio = (float)ssd_lcp / (float)validated_tokens;
+                                   if (lcp_ratio < MIN_LCP_RATIO) {
+                                       SLT_WRN(slot, "cold-start: rejecting SSD checkpoint for hybrid model "
+                                               "(lcp=%d < 80%% of validated=%lu/n_tokens=%lu, ratio=%.1f%%)\n",
+                                               ssd_lcp, (unsigned long)validated_tokens, (unsigned long)ssd_n_tokens,
+                                               lcp_ratio * 100.0f);
+                                       // Clear the loaded state and reset
+                                       llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                                        n_past = 0;
+                                        slot.prompt.tokens.clear();
+                                    } else {
+                                        // LCP covers most of the checkpoint - cap n_past to LCP
+                                        // so only validated recurrent state is used
+                                        n_past = std::min(n_past, ssd_lcp);
+                                        llama_memory_seq_rm_attn_only(llama_get_memory(ctx_tgt), slot.id, n_past, -1);
+                                    }
+                                }
+
+                                if (n_past > 0) {
                                 // Same-conversation checkpoints are always valid (size/staleness
                                 // checks removed from find_match for same-conv). Cap n_past to
                                 // leave a few tokens for processing instead of resetting.
@@ -3161,9 +3188,10 @@ private:
                                     SLT_WRN(slot, "cold-start restored SSD checkpoint (n_tokens=%" PRId64 ")\n",
                                             ssd_n_tokens);
                                 }
+                                } // n_past > 0 (not rejected by hybrid LCP check)
                             }
-                           } // else (not hybrid)
-                        }
+
+                        } // n_past == 0 && ssd_page_manager
 
                         // [TAG_PROMPT_LOGITS]
                         // when n_past >= task.n_tokens, we need to evaluate at least 1 token

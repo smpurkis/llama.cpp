@@ -7,7 +7,6 @@
 #include "server-context.h"
 #include "server-task.h"
 #include "llama.h"
-#include "build-info.h"
 
 #include <algorithm>
 #include <cstring>
@@ -71,14 +70,6 @@ void server_context_page_manager::set_model_info(const struct llama_model* model
         h *= 1099511628211ULL;
     }
     // Include build commit in compat_hash so checkpoints from different
-    // builds are automatically rejected (state serialization format may change)
-    const char * commit = llama_commit();
-    if (commit) {
-        for (int i = 0; commit[i]; i++) {
-            h ^= (uint64_t)(unsigned char)commit[i];
-            h *= 1099511628211ULL;
-        }
-    }
     uint32_t tk = (uint32_t)cache_type_k;
     h ^= (uint64_t)(tk & 0xFF);         h *= 1099511628211ULL;
     h ^= (uint64_t)((tk >> 8) & 0xFF);  h *= 1099511628211ULL;
@@ -419,7 +410,8 @@ bool server_context_page_manager::find_and_load_checkpoint(
     uint64_t& out_n_tokens,
     uint64_t conv_hash,
     int32_t n_past,
-    uint64_t max_n_tokens
+    uint64_t max_n_tokens,
+    int32_t* out_lcp
 ) {
     uint64_t effective_conv = conv_hash;
 
@@ -439,7 +431,8 @@ bool server_context_page_manager::find_and_load_checkpoint(
     server_ssd_cache* sc = get_or_create_cache(effective_conv);
     if (!sc) return false;
 
-    uint64_t ckpt_id = sc->find_match(tokens, tokens_size, current_turn, max_n_tokens, n_past);
+    int32_t match_lcp = 0;
+    uint64_t ckpt_id = sc->find_match(tokens, tokens_size, current_turn, max_n_tokens, n_past, &match_lcp);
     if (ckpt_id == 0) {
         cache_misses_++;
         return false;
@@ -448,6 +441,7 @@ bool server_context_page_manager::find_and_load_checkpoint(
     bool ok = sc->load(ckpt_id, ctx, out_pos_min, out_pos_max, out_n_tokens);
     if (ok) {
         cache_hits_++;
+        if (out_lcp) *out_lcp = match_lcp;
     } else {
         cache_misses_++;
     }
