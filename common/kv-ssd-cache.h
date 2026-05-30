@@ -166,7 +166,8 @@ uint64_t kv_ssd_find_match(kv_ssd_cache* cache,
                            const uint32_t* tokens, size_t tokens_size,
                            uint32_t current_turn,
                            uint64_t max_n_tokens,
-                           int32_t n_past = -1);
+                           int32_t n_past = -1,
+                           int32_t* out_lcp = nullptr);
 
 // Find best checkpoint for a slot.
 // Returns checkpoint ID or 0 if none found.
