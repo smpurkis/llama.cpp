@@ -653,6 +653,22 @@ public:
         mtmd_helper_log_set(common_log_default_callback, nullptr);
     }
 
+    // Synchronous per-user concurrency cap check. Returns true if the
+    // user_id (or the _anonymous bucket for empty user_id) is at
+    // max_concurrent_per_user. Safe to call from the HTTP handler thread
+    // before queueing a task - this is the fail-fast path that returns
+    // 429 to the client. The get_available_slot path is the authoritative
+    // check; this is an optimization to avoid queueing tasks we know
+    // we'll reject.
+    bool is_user_at_cap(const std::string& user_id) const {
+        if (params_base.max_concurrent_per_user <= 0) return false;
+        const std::string bucket = user_id.empty() ? std::string("_anonymous") : user_id;
+        std::lock_guard<std::mutex> lock(queue_tasks.mutex_tasks);
+        auto it = user_counts_.find(bucket);
+        const int cur = (it == user_counts_.end()) ? 0 : it->second;
+        return cur >= params_base.max_concurrent_per_user;
+    }
+
     ~server_context_impl() {
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
@@ -732,7 +748,7 @@ private:
     // Per-user in-flight slot count. empty user_id buckets as "_anonymous".
     // Accessed only under the queue's mutex_tasks (held by the slot allocation
     // path), so no separate lock is needed.
-    std::unordered_map<std::string, int> user_counts_;
+    mutable std::unordered_map<std::string, int> user_counts_;
 
     void destroy() {
         spec.reset();
@@ -4291,6 +4307,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             // malformed input, which the caller converts to HTTP 400.
             task.user_id = server_task::validate_user_id(
                 json_value(data, "llama_user_id", std::string()));
+
+            // fast-fail per-user cap. the authoritative cap check happens
+            // in get_available_slot; this is a UX optimization so a
+            // capped user gets HTTP 429 immediately rather than hanging
+            // on a deferred task. race window is benign - if the cap
+            // is no longer hit by the time get_available_slot runs,
+            // the task proceeds normally.
+            if (ctx_server.is_user_at_cap(task.user_id)) {
+                res->error(format_error_response(
+                    "per-user concurrency cap reached for user_id=" +
+                    (task.user_id.empty() ? std::string("<anonymous>") : task.user_id),
+                    ERROR_TYPE_RATE_LIMIT));
+                return res;
+            }
 
             // OAI-compat
             task.params.res_type          = res_type;
