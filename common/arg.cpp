@@ -2474,6 +2474,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ).set_env("LLAMA_ARG_N_PARALLEL"));
     }
     add_opt(common_arg(
+        {"--max-concurrent-per-user"}, "N",
+        string_format("per-user_id concurrency cap on in-flight slots (default: %d, 0 = unlimited). also applies to the _anonymous bucket.",
+                      params.max_concurrent_per_user),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: max-concurrent-per-user must be >= 0\n");
+            }
+            params.max_concurrent_per_user = value;
+        }
+    ).set_env("LLAMA_ARG_MAX_CONCURRENT_PER_USER").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-ns", "--sequences"}, "N",
         string_format("number of sequences to decode (default: %d)", params.n_sequences),
         [](common_params & params, int value) {
