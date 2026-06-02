@@ -375,6 +375,36 @@ private:
 
     bool has_evaluated_once = false;
 
+    // MoE expert activation tracking
+    struct expert_layer_stats {
+        std::vector<uint64_t> activation_count;  // [n_expert] per-expert activation count
+        uint64_t total_tokens = 0;              // total tokens processed in this layer
+    };
+
+    std::vector<expert_layer_stats> expert_stats;  // [n_layer] per-layer stats
+
+    // Read selected_experts tensors from the compute graph and update stats.
+    // Called after each decode if tracking is enabled.
+    void track_expert_activations(ggml_cgraph * gf, uint32_t n_tokens);
+
+public:
+    bool expert_tracking_enabled = false;
+
+    // Accessor for the public API
+    const expert_layer_stats * get_expert_stats(int32_t layer) const {
+        if (layer < 0 || layer >= (int32_t)expert_stats.size()) return nullptr;
+        return &expert_stats[layer];
+    }
+
+    void reset_expert_stats() {
+        for (auto & stats : expert_stats) {
+            std::fill(stats.activation_count.begin(), stats.activation_count.end(), 0);
+            stats.total_tokens = 0;
+        }
+    }
+
+private:
+
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
