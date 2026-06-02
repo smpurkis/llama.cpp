@@ -1583,6 +1583,39 @@ extern "C" {
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
 
     //
+    // MoE expert tracking
+    //
+    // Track which experts are activated per layer during inference.
+    // This is used for expert tiering: hot experts stay in VRAM,
+    // cold experts can be offloaded to RAM/SSD.
+
+    // Per-layer expert activation statistics
+    struct llama_expert_stats {
+        int32_t n_expert;       // number of experts in this layer
+        int32_t n_expert_used;  // number of experts used per token
+        uint64_t total_tokens;  // total tokens processed
+        uint64_t * activation_count; // [n_expert] activation counts (owned by llama_context)
+    };
+
+    // Enable/disable expert activation tracking.
+    // Disabled by default. Enabling adds minimal overhead per decode.
+    LLAMA_API void llama_expert_tracking_enable(struct llama_context * ctx, bool enable);
+
+    // Check if expert tracking is enabled
+    LLAMA_API bool llama_expert_tracking_enabled(const struct llama_context * ctx);
+
+    // Get expert activation statistics for a specific layer.
+    // Returns 0 on success, -1 if tracking is disabled or layer is out of range.
+    // The caller must NOT free activation_count - it points into internal state.
+    LLAMA_API int32_t llama_expert_stats_get(
+            const struct llama_context * ctx,
+            int32_t layer,
+            struct llama_expert_stats * stats);
+
+    // Reset all expert activation statistics to zero.
+    LLAMA_API void llama_expert_stats_reset(struct llama_context * ctx);
+
+    //
     // training
     //
 

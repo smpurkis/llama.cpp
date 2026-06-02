@@ -472,6 +472,16 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    // Initialize MoE expert tracking (disabled by default)
+    {
+        const int64_t n_layer = hparams.n_layer;
+        const int64_t n_expert = hparams.n_expert;
+        expert_stats.resize(n_layer);
+        for (int64_t il = 0; il < n_layer; ++il) {
+            expert_stats[il].activation_count.resize(n_expert, 0);
+        }
+    }
 }
 
 llama_context::~llama_context() {
@@ -693,6 +703,58 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+}
+
+void llama_context::track_expert_activations(ggml_cgraph * gf, uint32_t /* n_tokens */) {
+    if (!gf || !expert_tracking_enabled) return;
+
+    const int64_t n_layer = model.hparams.n_layer;
+    const int64_t n_expert = model.hparams.n_expert;
+    if (n_expert <= 0) return;  // Not an MoE model
+
+    // Search the compute graph for "ffn_moe_topk" tensors.
+    // These contain the selected expert indices [n_expert_used, n_tokens].
+    // The tensor name format is "ffn_moe_topk-<layer>".
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    for (int i = 0; i < n_nodes; i++) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        if (!node || node->type != GGML_TYPE_I32) continue;
+
+        const char * name = ggml_get_name(node);
+        if (!name) continue;
+
+        // Match "ffn_moe_topk" prefix
+        if (strncmp(name, "ffn_moe_topk", 13) != 0) continue;
+
+        // Extract layer index from name: "ffn_moe_topk-<layer>"
+        // (ggml_format_name uses "-" separator)
+        int il = -1;
+        if (sscanf(name, "ffn_moe_topk-%d", &il) != 1) continue;
+        if (il < 0 || il >= n_layer) continue;
+
+        // Read the expert indices from the tensor.
+        // Shape: [n_expert_used, n_tokens]
+        const int64_t n_expert_used = node->ne[0];
+        const int64_t n_tok = node->ne[1];
+
+        // Allocate a temporary buffer and copy data from the tensor
+        const size_t data_size = ggml_nelements(node) * sizeof(int32_t);
+        std::vector<int32_t> expert_indices(data_size / sizeof(int32_t));
+        ggml_backend_tensor_get(node, expert_indices.data(), 0, data_size);
+
+        // Update activation counts
+        auto & stats = expert_stats[il];
+        stats.total_tokens += n_tok;
+
+        for (int64_t t = 0; t < n_tok; t++) {
+            for (int64_t e = 0; e < n_expert_used; e++) {
+                int32_t expert_id = expert_indices[t * n_expert_used + e];
+                if (expert_id >= 0 && expert_id < (int32_t)n_expert) {
+                    stats.activation_count[expert_id]++;
+                }
+            }
+        }
+    }
 }
 
 void llama_context::synchronize() {
@@ -1891,6 +1953,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
+
+        // Track MoE expert activations
+        if (expert_tracking_enabled) {
+            track_expert_activations(res->get_gf(), ubatch.n_tokens);
+        }
 
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
@@ -4134,6 +4201,45 @@ void llama_perf_context_print(const llama_context * ctx) {
 
 void llama_perf_context_reset(llama_context * ctx) {
     ctx->perf_reset();
+}
+
+//
+// MoE expert tracking
+//
+
+void llama_expert_tracking_enable(struct llama_context * ctx, bool enable) {
+    if (!ctx) return;
+    ctx->expert_tracking_enabled = enable;
+    if (!enable) {
+        ctx->reset_expert_stats();
+    }
+}
+
+bool llama_expert_tracking_enabled(const struct llama_context * ctx) {
+    if (!ctx) return false;
+    return ctx->expert_tracking_enabled;
+}
+
+int32_t llama_expert_stats_get(const struct llama_context * ctx, int32_t layer, struct llama_expert_stats * stats) {
+    if (!ctx || !stats) return -1;
+
+    const llama_model & model = ctx->get_model();
+    if (layer < 0 || (uint32_t)layer >= model.hparams.n_layer) return -1;
+
+    const auto * layer_stats = ctx->get_expert_stats(layer);
+    if (!layer_stats) return -1;
+
+    stats->n_expert = (int32_t)layer_stats->activation_count.size();
+    stats->n_expert_used = model.hparams.n_expert_used;
+    stats->total_tokens = layer_stats->total_tokens;
+    stats->activation_count = const_cast<uint64_t*>(layer_stats->activation_count.data());
+
+    return 0;
+}
+
+void llama_expert_stats_reset(struct llama_context * ctx) {
+    if (!ctx) return;
+    ctx->reset_expert_stats();
 }
 
 //
