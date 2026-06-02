@@ -202,17 +202,6 @@ extern "C" {
         LLAMA_SPLIT_MODE_TENSOR = 3,
     };
 
-    enum llama_load_mode {
-        LLAMA_LOAD_MODE_NONE       = 0, // no special loading mode
-        LLAMA_LOAD_MODE_MMAP       = 1, // memory map the model
-        LLAMA_LOAD_MODE_MLOCK      = 2, // force system to keep model in RAM rather than swapping or compressing
-        LLAMA_LOAD_MODE_MMAP_MLOCK = 3, // mmap + force system to keep model in RAM rather than swapping or compressing
-        LLAMA_LOAD_MODE_DIRECT_IO  = 4, // use direct I/O if available
-    };
-
-    LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
-    LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
-
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
         LLAMA_CONTEXT_TYPE_MTP     = 1,
@@ -312,7 +301,6 @@ extern "C" {
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
-        enum llama_load_mode  load_mode;  // how to load the model
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
@@ -333,6 +321,9 @@ extern "C" {
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
+        bool use_mmap;        // use mmap if possible
+        bool use_direct_io;   // use direct io, takes precedence over use_mmap when supported
+        bool use_mlock;       // force system to keep model in RAM
         bool check_tensors;   // validate model tensor data
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
@@ -1116,9 +1107,6 @@ extern "C" {
     LLAMA_API bool llama_vocab_get_add_eos(const struct llama_vocab * vocab);
     LLAMA_API bool llama_vocab_get_add_sep(const struct llama_vocab * vocab);
 
-    // model-specific suppress tokens (gguf key: tokenizer.ggml.suppress_tokens)
-    LLAMA_API const llama_token * llama_vocab_get_suppress_tokens(const struct llama_vocab * vocab, int32_t * n_suppress_tokens);
-
     LLAMA_API llama_token llama_vocab_fim_pre(const struct llama_vocab * vocab);
     LLAMA_API llama_token llama_vocab_fim_suf(const struct llama_vocab * vocab);
     LLAMA_API llama_token llama_vocab_fim_mid(const struct llama_vocab * vocab);
@@ -1604,12 +1592,6 @@ extern "C" {
     // Check if expert tracking is enabled
     LLAMA_API bool llama_expert_tracking_enabled(const struct llama_context * ctx);
 
-    // Get the number of experts per layer (0 if not an MoE model)
-    LLAMA_API int32_t llama_model_n_expert(const struct llama_model * model);
-
-    // Get the number of experts used per token (0 if not an MoE model)
-    LLAMA_API int32_t llama_model_n_expert_used(const struct llama_model * model);
-
     // Get expert activation statistics for a specific layer.
     // Returns 0 on success, -1 if tracking is disabled or layer is out of range.
     // The caller must NOT free activation_count - it points into internal state.
@@ -1620,79 +1602,6 @@ extern "C" {
 
     // Reset all expert activation statistics to zero.
     LLAMA_API void llama_expert_stats_reset(struct llama_context * ctx);
-
-    // Per-layer snapshot of the expert IDs selected in the most recent decode.
-    // Filled by track_expert_activations() after each decode when tracking is enabled.
-    // Used by the MoE expert offload subsystem to pre-load the experts that
-    // will likely fire next (temporal locality in autoregressive generation).
-    struct llama_expert_last_selection {
-        int32_t n_expert_used;       // experts selected per token (= model n_expert_used)
-        int32_t n_tokens;            // number of tokens in the last decode batch
-        // [n_tokens * n_expert_used] row-major: selected[t * n_expert_used + e]
-        // Owned by llama_context. Do not free. Valid until the next decode().
-        const int32_t * selected;
-    };
-
-    // Get the most recent per-token expert selection for a layer.
-    // Returns 0 on success, -1 if tracking is disabled, not an MoE model, or
-    // layer out of range.
-    LLAMA_API int32_t llama_expert_last_selected_get(
-            const struct llama_context * ctx,
-            int32_t layer,
-            struct llama_expert_last_selection * selection);
-
-    // Clear the most recent expert selection snapshot (forces re-warm on next decode).
-    LLAMA_API void llama_expert_last_selected_clear(struct llama_context * ctx);
-
-    // Set the source model path. Used by the MoE residency subsystem to
-    // derive the co-activation persistence file location. Caller may pass
-    // an empty string to disable persistence.
-    LLAMA_API void llama_set_model_path(struct llama_context * ctx, const char * path);
-
-    //
-    // MoE expert residency (Phase 1, madvise-based)
-    //
-
-    // Public configuration for MoE expert residency management.
-    // All fields are POD for C compatibility; the implementation casts.
-    struct llama_moe_residency_config {
-        uint8_t enabled;                // master switch (0/1)
-        uint32_t max_resident_per_layer; // experts kept hot per layer (default 16)
-        uint8_t prewarm_on_init;        // prewarm at startup (0/1, default 1)
-        uint32_t prewarm_top_k;          // experts to prewarm if no stats (default 8)
-        uint8_t log_per_decode;         // log stats every N decodes (0/1, default 1)
-    };
-
-    // Return a config populated with sensible defaults.
-    LLAMA_API struct llama_moe_residency_config llama_moe_residency_config_default(void);
-
-    // Enable MoE expert residency management. When enabled, the context
-    // tracks which MoE experts fire per layer and uses madvise() to keep
-    // hot experts paged in while cold ones are evicted from RAM. This
-    // reduces physical memory pressure on the model. Requires the model to
-    // be loaded with mmap enabled (default). Tracking is also enabled.
-    //
-    // The state is built lazily on the next sched_reserve() (i.e. on the
-    // first decode). Returns 0 on success, -1 if the model is not MoE.
-    LLAMA_API int32_t llama_moe_residency_enable(
-            struct llama_context * ctx,
-            const struct llama_moe_residency_config * cfg);
-
-    // Disable MoE expert residency. Releases any pages marked WILLNEED.
-    LLAMA_API void llama_moe_residency_disable(struct llama_context * ctx);
-
-    // Stats snapshot. All counts are cumulative since enable().
-    struct llama_moe_residency_stats {
-        uint64_t total_hits;       // expert touches that were already loaded
-        uint64_t total_misses;     // expert touches that required MADV_WILLNEED
-        uint64_t total_evicted;    // experts removed from LRU via MADV_DONTNEED
-        uint64_t decode_count;     // total decode() calls observed
-        uint64_t moe_layer_count;  // number of MoE layers in the model
-    };
-
-    LLAMA_API void llama_moe_residency_stats_get(
-            const struct llama_context * ctx,
-            struct llama_moe_residency_stats * out);
 
     //
     // training
