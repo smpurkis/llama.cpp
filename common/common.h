@@ -629,6 +629,8 @@ struct common_params {
     size_t cache_ssd_page_size_tokens = 1024;     // tokens per page (512/1024/2048)
    int32_t cache_ssd_max_cold = 0;         // max cold tier checkpoints (0=unlimited)
     int32_t cache_ssd_max_conversations = 16; // max conversation directories
+    int32_t cache_ssd_hot_ram_mib = 0;       // hot tier RAM budget in MiB (0=auto-size)
+    int32_t cache_ssd_warm_ram_mib = 0;      // warm tier RAM budget in MiB (0=auto-size)
     int32_t prompt_cache_max = 8;           // max prompt buffer entries (deduplicated system prompts)
 
    std::string hostname      = "127.0.0.1";

@@ -1100,10 +1100,17 @@ private:
             cfg.hot_window_tokens = params_base.cache_ssd_hot_window_tokens;
             cfg.warm_window_tokens = params_base.cache_ssd_warm_window_tokens;
             cfg.page_size_tokens = params_base.cache_ssd_page_size_tokens;
-            cfg.auto_size = true;
+            cfg.auto_size = (params_base.cache_ssd_hot_ram_mib == 0 && params_base.cache_ssd_warm_ram_mib == 0);
             cfg.max_cold_checkpoints = params_base.cache_ssd_max_cold;
             cfg.memory_reserve = 0.15f;
             cfg.turn_inactivity_threshold = 2;
+            // Override RAM budgets if explicitly set (in MiB -> bytes)
+            if (params_base.cache_ssd_hot_ram_mib > 0) {
+                cfg.max_hot_bytes = (size_t)params_base.cache_ssd_hot_ram_mib * 1024 * 1024;
+            }
+            if (params_base.cache_ssd_warm_ram_mib > 0) {
+                cfg.max_warm_bytes = (size_t)params_base.cache_ssd_warm_ram_mib * 1024 * 1024;
+            }
 
             ssd_page_manager = std::make_unique<llama::server_context_page_manager>(
                 params_base.cache_ssd_path.c_str(),
@@ -1118,9 +1125,11 @@ private:
 
             SRV_INF("SSD-backed KV cache initialized at '%s' (hot=%zu, warm=%zu, page=%zu tokens)\n",
                    params_base.cache_ssd_path.c_str(),
-                   cfg.hot_window_tokens,
-                   cfg.warm_window_tokens,
-                   cfg.page_size_tokens);
+                   cfg.hot_window_tokens, cfg.warm_window_tokens, cfg.page_size_tokens);
+            if (!cfg.auto_size) {
+                SRV_INF("SSD cache RAM budgets: hot=%d MiB, warm=%d MiB (auto-size disabled)\n",
+                       params_base.cache_ssd_hot_ram_mib, params_base.cache_ssd_warm_ram_mib);
+            }
 
             // Set model compatibility info for config validation on load
             ssd_page_manager->set_model_info(model_tgt,
