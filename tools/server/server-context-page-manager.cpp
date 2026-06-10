@@ -485,6 +485,15 @@ bool server_context_page_manager::find_and_load_checkpoint(
             cache_hits_++;
             if (out_lcp) *out_lcp = match_lcp;
             if (out_is_continuation) *out_is_continuation = false;
+            // Same-user match: out_overlap must be set so the Case 2 cold-start
+            // validation in server-context.cpp can recognize a full-prefix
+            // match. The conversation hash was already verified to be in
+            // user_wrappers_, so by construction this is the same conversation
+            // and the LCP reflects how much of the stored prefix matched.
+            // 1.0 signals "same conversation, full coverage" to the caller.
+            // Case 2 still gates on ssd_lcp >= PREFIX_MAX, so this is a no-op
+            // when the LCP is too small to trust beyond the stored prefix.
+            if (out_overlap) *out_overlap = 1.0f;
         } else {
             cache_misses_++;
         }
@@ -530,6 +539,15 @@ bool server_context_page_manager::find_and_load_checkpoint(
         cache_hits_++;
         if (out_lcp) *out_lcp = match_lcp;
         if (out_is_continuation) *out_is_continuation = is_continuation;
+        // Same-conversation match (effective_conv matched a loaded cache and
+        // find_match returned a hit on the stored prefix). The continuation
+        // path above already set out_overlap from kv_ssd_find_continuation,
+        // so only set it here when this is NOT a continuation. Same-conv
+        // overlap is 1.0 by construction: we matched the cache for THIS
+        // conv_hash, and the LCP shows how much of the stored prefix aligned.
+        // Case 2 in server-context.cpp still requires ssd_lcp >= PREFIX_MAX,
+        // so a short LCP safely falls through to the partial-coverage branch.
+        if (out_overlap && !is_continuation) *out_overlap = 1.0f;
     } else {
         cache_misses_++;
     }
