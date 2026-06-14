@@ -1181,9 +1181,12 @@ private:
             sys_cache->max_entries = (size_t) params_base.cache_ssd_system_prompts;
             sys_cache->max_unused_days = params_base.cache_ssd_system_max_days;
 
-            // compat hash: same as set_model_info in page-manager
-            // (llama_model_desc + type_k + type_v + build commit). must match
-            // exactly so checkpoints created by either path are interoperable.
+            // compat hash: must match set_model_info() in server-context-page-manager.cpp
+            // exactly. Both compute llama_model_desc + type_k + type_v. The build
+            // commit is NOT included - it was removed from the page-manager hash in
+            // commit e5272dfc6 because every rebuild would otherwise invalidate
+            // all checkpoints, defeating the cross-rebuild cache. Keep the two
+            // computations in sync if you change this.
             uint64_t compat = 0;
             {
                 char desc_buf[2048];
@@ -1204,13 +1207,6 @@ private:
                     h ^= (uint64_t)((tv >> 8) & 0xFF);  h *= 1099511628211ULL;
                     h ^= (uint64_t)((tv >> 16) & 0xFF); h *= 1099511628211ULL;
                     h ^= (uint64_t)((tv >> 24) & 0xFF); h *= 1099511628211ULL;
-                    const char * commit = llama_commit();
-                    if (commit) {
-                        for (const char * p = commit; *p; p++) {
-                            h ^= (uint64_t)(unsigned char) *p;
-                            h *= 1099511628211ULL;
-                        }
-                    }
                     compat = h;
                 }
             }
