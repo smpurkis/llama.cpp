@@ -1702,6 +1702,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.prompt_cache_max = value;
         }
     ).set_env("LLAMA_ARG_PROMPT_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ssd-system-prompts"}, "N",
+        string_format("max global system prompt entries cached for reuse across conversations (default: %d, 0=disabled)", params.cache_ssd_system_prompts),
+        [](common_params & params, int value) {
+            params.cache_ssd_system_prompts = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_SYSTEM_PROMPTS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-ssd-system-max-days"}, "N",
+        string_format("expire system prompt cache entries unused for N days (default: %d, 0=never)", params.cache_ssd_system_max_days),
+        [](common_params & params, int value) {
+            params.cache_ssd_system_max_days = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_SYSTEM_MAX_DAYS").set_examples({LLAMA_EXAMPLE_SERVER}));
    add_opt(common_arg(
         {"-ssd-ps", "--cache-ssd-page-size"}, "N",
         string_format("tokens per page for SSD cache: 512, 1024, 2048 (default: %zu)", params.cache_ssd_page_size_tokens),

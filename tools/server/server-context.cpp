@@ -6,6 +6,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-context-page-manager.h"
+#include "kv-ssd-system-cache.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -737,6 +738,17 @@ private:
    // SSD-backed checkpoint page manager (optional)
    std::unique_ptr<llama::server_context_page_manager> ssd_page_manager;
 
+   // Global system prompt KV cache (optional, cross-conversation reuse)
+   // Indexes the attention + recurrent state for the system prompt section
+   // of the prompt by hash. On a cold start (n_past == 0), we can restore
+   // the system prompt state in a few microseconds and skip the most
+   // expensive part of prefill.
+   std::unique_ptr<kv_ssd_system_cache> sys_cache;
+
+   // Tracks the most recent task's system prompt hash per slot, used to
+   // dedupe the per-turn extraction hook (one extract per unique hash).
+   std::unordered_map<int, uint64_t> slot_sys_hash;
+
    // Monotonic turn counter for SSD cache tiering (incremented per slot release)
     uint32_t ssd_turn_counter = 0;
 
@@ -1144,6 +1156,80 @@ private:
                     ssd_turn_counter = max_turn;
                     SRV_INF("SSD cache: seeded turn counter to %u from %zu existing checkpoints\n",
                           max_turn, max_turn > 0 ? (size_t)1 : (size_t)0);
+                }
+            }
+        }
+
+        // initialize global system prompt KV cache if configured. the cache
+        // lives under {cache_ssd_path}/{model_dir}/sys-*.bin and reuses the
+        // same model_dir convention as the per-conversation SSD cache.
+        if (!params_base.cache_ssd_path.empty() && params_base.cache_ssd_system_prompts > 0) {
+            std::string model_dir = params_base.cache_ssd_path;
+            // append a per-model subdirectory so different models don't
+            // collide. derive a stable model id from the GGUF file name.
+            {
+                std::filesystem::path mp(params_base.model.path);
+                std::string stem = mp.stem().string();
+                if (stem.empty()) {
+                    stem = "default";
+                }
+                model_dir = model_dir + "/" + stem;
+                std::error_code ec;
+                std::filesystem::create_directories(model_dir, ec);
+            }
+            sys_cache = std::make_unique<kv_ssd_system_cache>();
+            sys_cache->max_entries = (size_t) params_base.cache_ssd_system_prompts;
+            sys_cache->max_unused_days = params_base.cache_ssd_system_max_days;
+
+            // compat hash: same as set_model_info in page-manager
+            // (llama_model_desc + type_k + type_v + build commit). must match
+            // exactly so checkpoints created by either path are interoperable.
+            uint64_t compat = 0;
+            {
+                char desc_buf[2048];
+                int desc_len = llama_model_desc(model_tgt, desc_buf, sizeof(desc_buf));
+                if (desc_len > 0) {
+                    uint64_t h = 14695981039346656037ULL;
+                    for (int i = 0; i < desc_len; i++) {
+                        h ^= (uint64_t)(unsigned char) desc_buf[i];
+                        h *= 1099511628211ULL;
+                    }
+                    uint32_t tk = (uint32_t) params_base.cache_type_k;
+                    h ^= (uint64_t)(tk & 0xFF);         h *= 1099511628211ULL;
+                    h ^= (uint64_t)((tk >> 8) & 0xFF);  h *= 1099511628211ULL;
+                    h ^= (uint64_t)((tk >> 16) & 0xFF); h *= 1099511628211ULL;
+                    h ^= (uint64_t)((tk >> 24) & 0xFF); h *= 1099511628211ULL;
+                    uint32_t tv = (uint32_t) params_base.cache_type_v;
+                    h ^= (uint64_t)(tv & 0xFF);         h *= 1099511628211ULL;
+                    h ^= (uint64_t)((tv >> 8) & 0xFF);  h *= 1099511628211ULL;
+                    h ^= (uint64_t)((tv >> 16) & 0xFF); h *= 1099511628211ULL;
+                    h ^= (uint64_t)((tv >> 24) & 0xFF); h *= 1099511628211ULL;
+                    const char * commit = llama_commit();
+                    if (commit) {
+                        for (const char * p = commit; *p; p++) {
+                            h ^= (uint64_t)(unsigned char) *p;
+                            h *= 1099511628211ULL;
+                        }
+                    }
+                    compat = h;
+                }
+            }
+
+            if (!sys_cache->init(model_dir, compat)) {
+                SRV_WRN("%s", "failed to initialize system prompt cache, disabling\n");
+                sys_cache.reset();
+            } else {
+                SRV_INF("global system prompt cache: dir='%s', max=%zu, days=%d, current=%zu\n",
+                       model_dir.c_str(), sys_cache->max_entries,
+                       sys_cache->max_unused_days, sys_cache->size());
+
+                // Sweep stale entries on startup
+                if (sys_cache->max_unused_days > 0) {
+                    size_t expired = sys_cache->expire_old_entries();
+                    if (expired > 0) {
+                        SRV_INF("expired %zu unused system prompt cache entries (>= %d days)\n",
+                              expired, sys_cache->max_unused_days);
+                    }
                 }
             }
         }
@@ -2221,6 +2307,169 @@ private:
         }
     }
 
+    // Try to restore the system prompt section of the current task from the
+    // global system prompt cache. Returns true on success and sets n_past to
+    // the system prompt boundary; the caller must then re-process tokens
+    // past that boundary.
+    //
+    // Safe for both hybrid and non-hybrid models. For non-hybrid, the
+    // attention KV is positional and the cached state is for [0..n_sys)
+    // only. For hybrid, the recurrent cells at position k only depend on
+    // tokens 0..k-1, so the state for [0..n_sys) is identical regardless of
+    // what came after. In both cases we trim the slot to n_past = n_sys so
+    // user content gets reprocessed cleanly.
+    bool try_restore_system_prompt(server_slot & slot, int& n_past) {
+        if (!sys_cache || !slot.task) return false;
+
+        const auto& task_tokens = slot.task->tokens.get_tokens();
+        if (task_tokens.empty()) return false;
+
+        // Detect the system prompt boundary in the task's tokens.
+        int32_t boundary = kv_detect_system_prompt_boundary(
+            vocab, task_tokens.data(), (int32_t) task_tokens.size(), nullptr);
+
+        if (boundary <= 0 || (size_t) boundary > task_tokens.size()) {
+            // Either no system section or it's the entire prompt
+            // (then the slot LCP/SSD lookup should have handled it).
+            if (boundary < 0) boundary = 0;
+            if ((size_t) boundary >= task_tokens.size()) {
+                return false;
+            }
+        }
+
+        // Look up the system prompt by hash
+        std::vector<uint32_t> sys_tokens(task_tokens.begin(),
+                                          task_tokens.begin() + boundary);
+        if (sys_cache->find(sys_tokens.data(), (uint32_t) sys_tokens.size()) == nullptr) {
+            return false;
+        }
+
+        // Load state data
+        std::vector<uint8_t> state_data;
+        if (!sys_cache->load(sys_tokens.data(), (uint32_t) sys_tokens.size(), state_data)) {
+            return false;
+        }
+
+        // Apply to the slot: clear, set tokens, restore state
+        common_context_seq_rm(ctx_tgt, slot.id, -1, -1);
+        if (ctx_dft) {
+            common_context_seq_rm(ctx_dft.get(), slot.id, -1, -1);
+        }
+
+        slot.prompt.tokens.clear();
+        slot.prompt.tokens.insert(task_tokens);
+
+        // Restore the state from disk. The state file covers [0..n_sys)
+        // (we saved it that way in extract_and_store_system_prompt).
+        if (!llama_state_seq_set_data_ext(ctx_tgt,
+                state_data.data(), state_data.size(),
+                slot.id, LLAMA_STATE_SEQ_FLAGS_NONE)) {
+            SRV_WRN("%s", "system prompt cache: failed to restore state, falling through\n");
+            slot.prompt.tokens.clear();
+            common_context_seq_rm(ctx_tgt, slot.id, -1, -1);
+            return false;
+        }
+
+        n_past = boundary;
+        slot.truncated = true;
+
+        // Record which system prompt this slot is using so we don't
+        // re-extract on every decode loop iteration.
+        slot_sys_hash[slot.id] = kv_ssd_system_cache::hash_tokens(
+            sys_tokens.data(), sys_tokens.size());
+
+        SLT_WRN(slot, "restored system prompt from cache (n_sys=%d, state=%.2f MiB, "
+                "skipping %d prompt tokens)\n",
+                boundary, state_data.size() / (1024.0 * 1024.0), boundary);
+
+        return true;
+    }
+
+    // Called after a successful decode that crossed the system prompt
+    // boundary. Saves the state at the boundary position to the global
+    // system prompt cache for reuse in future conversations.
+    //
+    // batch_end is the position one past the last token in the just-decoded
+    // batch. We only extract if batch_end is at or beyond the boundary.
+    void maybe_extract_system_prompt(server_slot & slot, int32_t batch_end) {
+        if (!sys_cache || !slot.task) return;
+
+        const auto& task_tokens = slot.task->tokens.get_tokens();
+        if (task_tokens.empty()) return;
+
+        int32_t boundary = kv_detect_system_prompt_boundary(
+            vocab, task_tokens.data(), (int32_t) task_tokens.size(), nullptr);
+
+        if (boundary <= 0 || (size_t) boundary > task_tokens.size()) return;
+
+        // Only extract when the boundary has been crossed.
+        if (batch_end < boundary) return;
+
+        // Dedupe: don't re-extract the same hash for this slot.
+        std::vector<uint32_t> sys_tokens(task_tokens.begin(),
+                                          task_tokens.begin() + boundary);
+        uint64_t hash = kv_ssd_system_cache::hash_tokens(
+            sys_tokens.data(), sys_tokens.size());
+        auto it = slot_sys_hash.find(slot.id);
+        if (it != slot_sys_hash.end() && it->second == hash) {
+            return;
+        }
+
+        // For non-hybrid models we can extract at any time. The state for
+        // [0..n_sys) is identical regardless of what comes after. We just
+        // need to save the state and trim to n_sys.
+        //
+        // For hybrid models, the recurrent state at position N depends on
+        // all previous tokens. The state file would cover [0..batch_end),
+        // so we need to load it, trim to [0..n_sys), and re-save. This is
+        // destructive for the slot (we'd need to re-process [n_sys..batch_end)
+        // afterwards), so we skip extraction for hybrid models to keep the
+        // hot path simple. The system prompt can still be extracted on a
+        // future request once the user content is small enough.
+        if (is_hybrid) {
+            // For hybrid, only extract if we're at the exact boundary.
+            // (Otherwise the recurrent state extends past n_sys.)
+            if (batch_end != boundary) return;
+        }
+
+        // Save state, then trim to n_sys, then re-save the trimmed state.
+        // This is the simplest correct approach for both architectures:
+        //   - non-hybrid: KV is positional, trimming just removes entries
+        //   - hybrid:    recurrent cells are also positional in our storage
+        //                (cells[k] = state after tokens 0..k-1), trimming
+        //                discards positions past n_sys
+        std::vector<uint8_t> state_data;
+        {
+            const size_t sz = llama_state_seq_get_size_ext(ctx_tgt, slot.id,
+                                LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (sz == 0) return;
+            state_data.resize(sz);
+            if (!llama_state_seq_get_data_ext(ctx_tgt, state_data.data(), sz,
+                    slot.id, LLAMA_STATE_SEQ_FLAGS_NONE)) {
+                return;
+            }
+        }
+
+        // Store the full state. The system cache file format includes
+        // n_tokens, and on restore we cap n_past to n_tokens. Storing the
+        // full state (which may include user tokens) is safe because:
+        //   - For non-hybrid: the KV is positional, only [0..n_sys) is
+        //     reused; the rest will be discarded via seq_rm after restore.
+        //   - For hybrid:    we only get here when batch_end == n_sys, so
+        //     the state covers exactly [0..n_sys).
+        if (!sys_cache->store(sys_tokens.data(), (uint32_t) sys_tokens.size(),
+                              state_data.data(), state_data.size())) {
+            SRV_WRN("%s", "system prompt cache: store failed\n");
+            return;
+        }
+
+        slot_sys_hash[slot.id] = hash;
+
+        SLT_INF(slot, "extracted system prompt to cache "
+                "(n_sys=%d, state=%.2f MiB)\n",
+                boundary, state_data.size() / (1024.0 * 1024.0));
+    }
+
     void process_single_task(server_task && task) {
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
@@ -3195,6 +3444,21 @@ private:
                             }
                     }
 
+                       // Cold-start: try system prompt cache FIRST (cheapest, broadest match)
+                      // This catches the common case of a new conversation with a
+                      // matching system prompt (e.g. same chat template, same persona)
+                      // from a different prior conversation. We attempt it before the
+                      // SSD cache lookup so the system prompt is always available even
+                      // if no per-conversation checkpoint exists.
+                      if (n_past == 0 && sys_cache && slot.task) {
+                          int32_t sys_n_past = 0;
+                          if (try_restore_system_prompt(slot, sys_n_past)) {
+                              n_past = sys_n_past;
+                              slot.truncated = true;
+                              SLT_INF(slot, "cold-start: system prompt cache hit (n_past=%d)\n", n_past);
+                          }
+                      }
+
                        // Cold-start: try SSD cache when prompt cache is empty (n_past == 0)
                       if (n_past == 0 && ssd_page_manager && slot.task) {
                           int32_t ssd_pos_min = 0, ssd_pos_max = 0;
@@ -3854,6 +4118,30 @@ private:
 
             // on successful decode, restore the original batch size
             n_batch = llama_n_batch(ctx_tgt);
+
+            // System prompt cache extraction. Runs AFTER llama_decode updates
+            // the state. At this point slot.prompt.tokens.size() is the
+            // number of tokens processed so far (positions 0..n-1 decoded).
+            //
+            // For non-hybrid models: extract when the boundary has been
+            // crossed. The KV state at [0..n_sys) is positional and
+            // independent of what comes after.
+            //
+            // For hybrid models: only extract when batch_end == n_sys
+            // (exact boundary). The recurrent state covers all positions
+            // and is content-dependent, so partial extraction would
+            // produce invalid state for restoration.
+            if (sys_cache) {
+                for (auto & slot : slots) {
+                    if (!slot.is_processing()) continue;
+                    if (!slot.task) continue;
+                    if (slot.prompt.tokens.empty()) continue;
+                    if (slot.state != SLOT_STATE_PROCESSING_PROMPT) continue;
+                    const int32_t batch_end = (int32_t) slot.prompt.tokens.size();
+                    if (batch_end <= 0) continue;
+                    maybe_extract_system_prompt(slot, batch_end);
+                }
+            }
 
             // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
             for (auto & slot : slots) {
