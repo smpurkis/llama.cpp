@@ -6,42 +6,33 @@
 
 #include "kv-ssd-system-cache.h"
 #include "kv-ssd-cache.h"  // for kv_ssd_hash_tokens
-#include "kv-ssd-posix.h"
 #include "log.h"
 #include "llama.h"        // for llama_vocab / token attrs
 
 #include <algorithm>
 #include <cerrno>
-#include <climits>
 #include <cinttypes>
 #include <cstring>
 #include <cstdio>
-#include <cctype>
 #include <ctime>
-#include <filesystem>
+#include <dirent.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 namespace {
 
 // I/O helpers (duplicated minimally from kv-ssd-cache.cpp to keep
 // the system cache as a self-contained translation unit).
-bool pwrite_all(int fd, const void* buf, size_t count, int64_t offset) {
-    static const size_t chunk_max = 64 * 1024 * 1024; // 64 MiB
+bool pwrite_all(int fd, const void* buf, size_t count, off_t offset) {
     const char* ptr = (const char*)buf;
     size_t remaining = count;
-    int64_t off = offset;
+    off_t off = offset;
     while (remaining > 0) {
-        size_t chunk = remaining;
-        if (chunk > chunk_max) {
-            chunk = chunk_max;
-        }
-        ssize_t n = pwrite(fd, ptr, chunk, off);
+        ssize_t n = pwrite(fd, ptr, remaining, off);
         if (n < 0) {
             if (errno == EINTR) continue;
-            return false;
-        }
-        if (n == 0) {
-            errno = ENOSPC;
             return false;
         }
         ptr += n;
@@ -51,22 +42,17 @@ bool pwrite_all(int fd, const void* buf, size_t count, int64_t offset) {
     return true;
 }
 
-bool pread_all(int fd, void* buf, size_t count, int64_t offset) {
-    static const size_t chunk_max = 64 * 1024 * 1024; // 64 MiB
+bool pread_all(int fd, void* buf, size_t count, off_t offset) {
     char* ptr = (char*)buf;
     size_t remaining = count;
-    int64_t off = offset;
+    off_t off = offset;
     while (remaining > 0) {
-        size_t chunk = remaining;
-        if (chunk > chunk_max) {
-            chunk = chunk_max;
-        }
-        ssize_t n = pread(fd, ptr, chunk, off);
+        ssize_t n = pread(fd, ptr, remaining, off);
         if (n < 0) {
             if (errno == EINTR) continue;
             return false;
         }
-        if (n == 0) { errno = EIO; return false; }
+        if (n == 0) return false;
         ptr += n;
         off += n;
         remaining -= (size_t)n;
@@ -86,7 +72,7 @@ uint32_t aligned_size(uint32_t n) {
 // Print a 16-char hex hash for log messages
 std::string hex16(uint64_t h) {
     char buf[17];
-    std::snprintf(buf, sizeof(buf), "%016" PRIx64, h);
+    std::snprintf(buf, sizeof(buf), "%016lx", (unsigned long)h);
     return std::string(buf);
 }
 
@@ -119,53 +105,58 @@ bool kv_ssd_system_cache::init(const std::string& model_dir, uint64_t compat_has
     compat_hash_ = compat_hash;
 
     // Ensure directory exists
-    namespace fs = std::filesystem;
-    fs::path model_path(model_dir_);
-    if (!fs::exists(model_path)) {
-        std::error_code ec;
-        if (!fs::create_directory(model_path, ec) && ec.value() != 0) {
+    struct stat st;
+    if (stat(model_dir_.c_str(), &st) != 0) {
+        if (mkdir(model_dir_.c_str(), 0755) != 0 && errno != EEXIST) {
             LOG_ERR("system cache: failed to create %s: %s\n",
-                    model_dir_.c_str(), ec.message().c_str());
+                    model_dir_.c_str(), std::strerror(errno));
             return false;
         }
     }
 
-    if (!fs::is_directory(model_path)) {
-        LOG_ERR("system cache: %s is not a directory\n", model_dir_.c_str());
-        return false;
+    // Scan for existing sys-*.bin files
+    DIR* dir = opendir(model_dir_.c_str());
+    if (!dir) {
+        LOG_WRN("system cache: failed to open %s\n", model_dir_.c_str());
+        // Continue with empty cache - directory just got created.
+        initialized = true;
+        return true;
     }
 
     size_t loaded = 0;
     size_t rejected = 0;
-    for (const auto& entry : fs::directory_iterator(model_path)) {
-        std::string fname = entry.path().filename().string();
-        if (fname.size() < 9) continue;
-        if (fname.compare(0, 4, "sys-") != 0) continue;
-        if (fname.compare(fname.size() - 4, 4, ".bin") != 0) continue;
+    struct dirent* ent;
+    while ((ent = readdir(dir)) != nullptr) {
+        // Match sys-<16hex>.bin
+        const char* name = ent->d_name;
+        if (strncmp(name, "sys-", 4) != 0) continue;
+        size_t dlen = strlen(name);
+        if (dlen < 9 || strcmp(name + dlen - 4, ".bin") != 0) continue;
 
-        std::string filepath = entry.path().string();
-        kv_ssd_system_entry sys_entry;
-        if (load_entry_from_disk(filepath, sys_entry)) {
-            if (compat_hash != 0 && sys_entry.compat_hash != 0 && sys_entry.compat_hash != compat_hash) {
-                LOG_WRN("system cache: rejecting %s (compat_hash mismatch: stored=%016" PRIx64 " current=%016" PRIx64 ")\n",
-                        fname.c_str(),
-                        sys_entry.compat_hash,
-                        compat_hash);
+        std::string filepath = model_dir_ + "/" + name;
+        kv_ssd_system_entry entry;
+        if (load_entry_from_disk(filepath, entry)) {
+            if (compat_hash != 0 && entry.compat_hash != 0 && entry.compat_hash != compat_hash) {
+                LOG_WRN("system cache: rejecting %s (compat_hash mismatch: stored=%016lx current=%016lx)\n",
+                        name,
+                        (unsigned long)entry.compat_hash,
+                        (unsigned long)compat_hash);
                 rejected++;
                 continue;
             }
-            bytes_ += sys_entry.data.size();
-            entries_[sys_entry.hash] = std::move(sys_entry);
+            bytes_ += entry.data.size();
+            entries_[entry.hash] = std::move(entry);
             loaded++;
         } else {
             LOG_WRN("system cache: failed to load %s\n", filepath.c_str());
         }
     }
+    closedir(dir);
 
     initialized = true;
 
-    LOG_INF("system cache: initialized at %s (loaded=%zu, entries=%zu, bytes=%.1f MiB, rejected=%zu, max_entries=%zu, max_unused_days=%d)\n",
-            model_dir_.c_str(), loaded, entries_.size(),
+    LOG_INF("system cache: initialized at %s (entries=%zu, bytes=%.1f MiB, rejected=%zu, max_entries=%zu, max_unused_days=%d)\n",
+            model_dir_.c_str(), entries_.size(),
             (double)bytes_ / (1024.0 * 1024.0),
             rejected, max_entries, max_unused_days);
 
@@ -234,9 +225,8 @@ bool kv_ssd_system_cache::store(const uint32_t* tokens, uint32_t n_tokens,
 
     // New entry - persist to disk first, then add to in-memory
     if (!write_entry_to_disk(entry)) {
-        int se = errno;
-        LOG_ERR("system cache: failed to write %s: %s (errno=%d" SSD_WIN32_ERR_FMT ")\n",
-                entry.filepath.c_str(), std::strerror(se), se SSD_WIN32_ERR_ARG);
+        LOG_ERR("system cache: failed to write %s: %s\n",
+                entry.filepath.c_str(), std::strerror(errno));
         return false;
     }
 
@@ -311,76 +301,6 @@ bool kv_ssd_system_cache::load(const uint32_t* tokens, uint32_t n_tokens,
     return true;
 }
 
-const kv_ssd_system_entry* kv_ssd_system_cache::find_prefix_match(
-    const uint32_t* tokens, uint32_t n_query_tokens, uint32_t min_match)
-{
-    // Fallback for when boundary detection returns a slightly different n_sys
-    // than what was stored (e.g. the chat template inserts a few tokens
-    // between the system section and the first user message that vary
-    // between turns). The exact find() fails on n_tokens mismatch or hash
-    // mismatch, but the underlying system prompt is the same - we just need
-    // to find any stored entry whose first min(KV_SSD_SYS_TOKEN_MAX,
-    // n_query_tokens, entry.n_tokens) tokens match the query.
-    //
-    // Returns the entry whose prefix matches the query prefix for at
-    // least `min_match` tokens, or nullptr if none found.
-    if (!initialized || !tokens || n_query_tokens == 0 || min_match == 0) return nullptr;
-
-    const uint32_t verify_len = std::min({
-        (uint32_t)KV_SSD_SYS_TOKEN_MAX,
-        n_query_tokens,
-        (uint32_t)4096  // never scan more than 4k tokens per entry
-    });
-    if (verify_len < min_match) return nullptr;
-
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    // Use a non-const pointer for the bookkeeping writes (last_used/access_count)
-    // - the entries_ map values are mutable through the lock.
-    kv_ssd_system_entry* best = nullptr;
-    uint32_t best_match = 0;
-
-    for (auto & [hash, entry] : entries_) {
-        const uint32_t entry_prefix_len = std::min({
-            (uint32_t)entry.tokens.size(),
-            n_query_tokens,
-            verify_len
-        });
-        if (entry_prefix_len < min_match) continue;
-
-        uint32_t matched = 0;
-        for (uint32_t i = 0; i < entry_prefix_len; i++) {
-            if (entry.tokens[i] != tokens[i]) break;
-            matched++;
-        }
-
-        if (matched >= min_match && matched > best_match) {
-            best_match = matched;
-            best = &entry;
-        }
-    }
-
-    if (best) {
-        best->last_used = now_unix();
-        best->access_count++;
-        stats_hits++;
-        LOG_INF("system cache: prefix-match hit stored=%u query=%u matched=%u\n",
-                best->n_tokens, n_query_tokens, best_match);
-    } else {
-        stats_misses++;
-    }
-
-    return best;
-}
-
-bool kv_ssd_system_cache::load_prefix(const uint32_t* tokens, uint32_t n_query_tokens,
-                                      uint32_t min_match, std::vector<uint8_t>& out_data) {
-    const kv_ssd_system_entry* entry = find_prefix_match(tokens, n_query_tokens, min_match);
-    if (!entry) return false;
-    out_data = entry->data;
-    return true;
-}
-
 // =============================================================================
 // Eviction
 // =============================================================================
@@ -399,9 +319,8 @@ void kv_ssd_system_cache::evict_entry(uint64_t hash) {
 
     if (!it->second.filepath.empty()) {
         if (unlink(it->second.filepath.c_str()) != 0 && errno != ENOENT) {
-            int se = errno;
-            LOG_WRN("system cache: failed to delete %s: %s (errno=%d)\n",
-                    it->second.filepath.c_str(), std::strerror(se), se);
+            LOG_WRN("system cache: failed to delete %s: %s\n",
+                    it->second.filepath.c_str(), std::strerror(errno));
         }
     }
     entries_.erase(it);
@@ -492,7 +411,7 @@ bool kv_ssd_system_cache::load_entry_from_disk(const std::string& filepath, kv_s
     // Read data payload
     std::vector<uint8_t> data(rec.data_size);
     if (rec.data_size > 0) {
-        if (!pread_all(fd, data.data(), rec.data_size, (int64_t)sizeof(kv_ssd_system_record))) {
+        if (!pread_all(fd, data.data(), rec.data_size, (off_t)sizeof(kv_ssd_system_record))) {
             close(fd);
             return false;
         }
@@ -536,7 +455,7 @@ bool kv_ssd_system_cache::write_entry_to_disk(const kv_ssd_system_entry& entry) 
     bool ok = pwrite_all(fd, &rec, sizeof(rec), 0);
     if (ok && entry.data.size() > 0) {
         ok = pwrite_all(fd, entry.data.data(), entry.data.size(),
-                        (int64_t)sizeof(kv_ssd_system_record));
+                        (off_t)sizeof(kv_ssd_system_record));
     }
     fsync(fd);
     close(fd);
@@ -564,45 +483,6 @@ size_t kv_ssd_system_cache::bytes() const {
 // =============================================================================
 
 namespace {
-// Check if a token's decoded text indicates a role/structure marker
-// (as opposed to a true end-of-generation token). Some vocabularies
-// (GLM-4, Gemma) classify role tokens like <|system|>, <|user|>,
-// <|assistant|> as EOG. We need to distinguish these from actual
-// section-closing tokens like <|im_end|>, <|end_of_turn|>, <|eot_id|>.
-//
-// Substring match is sufficient here because:
-//   - Role markers are short special tokens (<|user|>, <|system|>, etc.)
-//   - The role name substring only appears in role markers, not in
-//     typical system prompt content (and even if it does, the worst
-//     case is a slightly shorter cached system prompt - still works)
-static bool is_role_marker_text(const std::string& text) {
-    if (text.empty()) return false;
-    if (text.find("system")    != std::string::npos) return true;
-    if (text.find("user")      != std::string::npos) return true;
-    if (text.find("assistant") != std::string::npos) return true;
-    if (text.find("human")     != std::string::npos) return true;
-    if (text.find("model")     != std::string::npos) return true;
-    if (text.find("tool")      != std::string::npos) return true;
-    if (text.find("function")  != std::string::npos) return true;
-    if (text.find("[INST]")    != std::string::npos) return true;
-    return false;
-}
-
-// Decode a token to text using the vocab. Special tokens are rendered
-// (e.g. <|im_start|>) so we can match role markers by their text.
-// Returns empty string on error.
-static std::string decode_token_for_boundary(
-    const llama_vocab* vocab,
-    llama_token token)
-{
-    char buf[256];
-    int n = llama_token_to_piece(vocab, token, buf, sizeof(buf), 0, true);
-    if (n <= 0) {
-        n = llama_token_to_piece(vocab, token, buf, sizeof(buf), 0, false);
-    }
-    if (n <= 0) return "";
-    return std::string(buf, n);
-}
 
 // Try to detect the system prompt end in tokens[0..n_tokens] using a
 // template-aware scan. We look for the first occurrence of one of these
@@ -647,125 +527,75 @@ int32_t kv_detect_system_prompt_boundary(
     int32_t n_tokens,
     const char* chat_template_hint)
 {
-    (void)chat_template_hint; // reserved for future template-aware detection
     if (!vocab || !tokens || n_tokens <= 0) return 0;
 
-    // Two-phase boundary detection. We compute a candidate boundary from
-    // each phase and return the minimum. The minimum is the most
-    // conservative (smallest) system prompt, which is the original
-    // design intent: cache just the system section, nothing more.
+    // Phase 1: template-aware scan. Look at the first few tokens to identify
+    // the system role marker, then find the matching end marker.
+
+    // Most chat templates start the system section with a sequence like
+    // <|im_start|>, system, \n. After the system content, the end marker
+    // (e.g. <|im_end|>) closes the section.
     //
-    // Phase 1: find the first user-role marker token. The user role
-    //   marker is a special token whose decoded text contains "user" or
-    //   "human" (case-insensitive). This is the most reliable method
-    //   because the user role name is always present in any chat
-    //   template that has a user/assistant turn structure, regardless
-    //   of whether the template uses EOG to close the system section.
+    // We assume:
+    //   tokens[0] = role-start token (e.g. <|im_start|>)
+    //   tokens[1] = role name (e.g. "system")
     //
-    //   Works for: GLM (<|user|>), Gemma (text "user"), Llama-3
-    //   (text "user"), ChatML (text "user"), Command-R, etc.
+    // We then search for the first end-marker token after that.
+
+    // (chat_template_hint is currently unused - reserved for future use
+    //  when we add explicit template-name dispatch.)
+
+    // The end of the system section is the first EOG token after the
+    // system role marker.
     //
-    //   We use llama_vocab_is_control() to filter out regular content
-    //   tokens that happen to contain "user" in their text (e.g. a
-    //   system prompt that says "user-facing assistant"). Control
-    //   tokens are always special/structural, never content words.
-    //   We also accept the text "user" or "User" etc. as exact matches
-    //   for templates like Llama-3 where "user" is a regular text
-    //   token (not a control token) but is still a role marker by
-    //   position.
+    // We accept any of: <|im_start|>, <|start_header_id|>, <start_of_turn>,
+    // or [INST]. We do this by trying to decode tokens[0] and checking
+    // for these strings.
     //
-    // Phase 2: EOG-based detection, skipping role-marker EOGs. This
-    //   preserves the original behavior for templates where the
-    //   system section is closed by a true EOG token (<|im_end|>,
-    //   <|end_of_turn|>, <|eot_id|>, etc.) and the role tokens
-    //   themselves are NOT classified as EOG (ChatML, Llama-3, standard
-    //   Gemma).
-    int32_t boundary_user = n_tokens;
-    int32_t boundary_eog  = n_tokens;
+    // Simpler approach: just look for the first EOG token and assume the
+    // first EOG is the end of the system section. This works for most
+    // chat templates where the system section is always first and always
+    // closed by an EOG token.
 
-    // Phase 1: find first user-role marker token
-    // Start from i=1 (skip BOS). The preceding-control-token check
-    // filters out content words that happen to be "user" or "human".
-    // Starting from i=2 would miss templates where the user role
-    // marker is at position 1 (Qwen3.6 with no system section:
-    // <|im_start|>user\n...).
-    for (int i = 1; i < n_tokens; i++) {
-        std::string text = decode_token_for_boundary(vocab, tokens[i]);
-        if (text.empty()) continue;
-
-        // Case-insensitive substring match for "user" or "human"
-        std::string lower;
-        lower.reserve(text.size());
-        for (char c : text) {
-            lower.push_back((char)std::tolower((unsigned char)c));
-        }
-        bool is_user_text = (lower.find("user")   != std::string::npos ||
-                             lower.find("human")  != std::string::npos);
-        if (!is_user_text) continue;
-
-        // Filter false positives: if the token is NOT a control/special
-        // token AND not an exact match for a known user-role text, it's
-        // probably content (e.g. "user_name" in the system prompt).
-        // For control tokens, the role-marker interpretation is correct.
-        // For exact text matches like "user" or "User", the role-marker
-        // interpretation is correct ONLY if the preceding token is a
-        // role-start control token (ChatML: <|im_start|>user, Llama-3:
-        // <|start_header_id|>user). Without this check, content that
-        // contains the word "user" (e.g. "user-facing" or a 19th-century
-        // novel that uses the word) gets falsely identified as a role
-        // marker, and the boundary lands inside the user content.
-        bool is_control = llama_vocab_is_control(vocab, tokens[i]);
-        bool is_exact_role = (text == "user" || text == "User" ||
-                              text == "USER" || text == "Human" ||
-                              text == "human" || text == "H" ||
-                              text == "<|user|>" || text == "<|USER|>");
-
-        if (is_control) {
-            // Control token with "user" in text - always a role marker
-            // (e.g. GLM's <|user|>, Gemma's <|user|>)
-        } else if (is_exact_role) {
-            // Exact text match (e.g. plain "user" token in ChatML/Llama-3)
-            // - verify preceded by a role-start control token
-            if (i < 1 || !llama_vocab_is_control(vocab, tokens[i-1])) {
-                continue;  // Content word "user", not a role marker
-            }
-        } else {
-            // Substring match but not control and not exact - content
-            // (e.g. "users", "user-facing"). Skip.
-            continue;
-        }
-
-        boundary_user = i;
-        break;
-    }
-
-    // Phase 2: EOG-based detection, skipping role-marker EOGs
+    // Walk forward from the start, skipping the role header tokens. We
+    // assume the role header is at most 5 tokens (e.g. <|im_start|>, system,
+    // \n for ChatML). For Llama-3 it's <|start_header_id|>, system,
+    // <|end_header_id|>, \n.
     const int ROLE_HEADER_MAX = 6;
-    int scan_start = 0;
+
     for (int i = 0; i < ROLE_HEADER_MAX && i < n_tokens; i++) {
         if (llama_vocab_is_eog(vocab, tokens[i])) {
+            // Hit an EOG before the system content - probably a BOS or
+            // something unusual. Skip and continue.
             continue;
         }
-        if (i < 1) continue;  // always skip token 0
-        scan_start = i + 1;
+        // Check if this is an EOG (system end marker)
+        // We need to look for the EOG AFTER some system content, not at
+        // the role header. So skip ROLE_HEADER_MAX tokens first.
+        if (i < 1) continue;  // always skip token 0 (the role-start)
+
+        // Check the remaining tokens in [i+1..n] for the first EOG
+        for (int j = i + 1; j < n_tokens; j++) {
+            if (llama_vocab_is_eog(vocab, tokens[j])) {
+                // j is the end-marker token. The system section ends
+                // AFTER j, so the boundary is j+1.
+                return j + 1;
+            }
+        }
+        // If we didn't find an EOG after this position, fall through to
+        // the next attempt.
         break;
     }
 
-    const int MAX_SYSTEM_SCAN = 64;
-    int scan_end = std::min(scan_start + MAX_SYSTEM_SCAN, n_tokens);
-    for (int j = scan_start; j < scan_end; j++) {
-        if (!llama_vocab_is_eog(vocab, tokens[j])) continue;
-        // Skip role-marker EOGs (GLM/Gemma classify role tokens as EOG)
-        std::string text = decode_token_for_boundary(vocab, tokens[j]);
-        if (is_role_marker_text(text)) continue;
-        boundary_eog = j + 1;
-        break;
+    // Phase 2: fall back to scanning the entire prompt for the first
+    // EOG token. If the very first token is an EOG, there's no system
+    // section (treat the whole prompt as non-system content).
+    for (int i = 0; i < n_tokens; i++) {
+        if (llama_vocab_is_eog(vocab, tokens[i])) {
+            return i + 1;
+        }
     }
 
-    // Return the minimum - most conservative system prompt boundary.
-    // This preserves original behavior for templates that work
-    // (ChatML, Llama-3, standard Gemma) and fixes GLM/Gemma where the
-    // original returned n_tokens (no cache) or a tiny boundary (3-7
-    // tokens of chat template header).
-    return std::min(boundary_user, boundary_eog);
+    // No EOG found - treat the whole prompt as one section.
+    return n_tokens;
 }
