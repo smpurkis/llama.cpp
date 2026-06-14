@@ -26,17 +26,13 @@ We're not faster at inference. We don't support more models. We don't add new qu
 
 **User isolation.** `user_id` as a first-class request parameter. Routes checkpoints to a `u/` namespace on disk. Per-user concurrency cap with HTTP 429 enforcement. Slot affinity (allocation prefers slots already owned by the requesting user for cache locality). OpenAI SDK compatible via `extra_body`. See [`docs/development/user-isolation-design.md`](docs/development/user-isolation-design.md).
 
-**MoE expert activation tracking.** HTTP endpoints (`/expert-stats`, `/expert-tracking`) plus a C API (`llama_expert_tracking_enable`, `llama_expert_stats_get`, `llama_expert_tracking_enabled`, `llama_expert_last_selected_get`, `llama_model_n_expert`, `llama_model_n_expert_used`) for reading per-layer expert activation counts and per-decode selections in real time. The activations feed the next feature.
-
-**MoE expert SSD residency.** Enabled by `--moe-expert-residency`. The runtime tracks which experts fire per layer (recency + frequency), uses `madvise(MADV_WILLNEED)` to prefetch hot expert pages into RAM, and `madvise(MADV_FREE)` to lazily release cold ones back to the mmap'd SSD file (the kernel keeps them resident while memory is available, drops them under pressure). Lets models whose total footprint exceeds physical RAM run at near-RAM speed - active ~3% of weights stay paged in, the rest stay on disk and only pay SSD latency on cold misses. Validated hit rates: 95.5% on Qwen3.6-35B-A3B Q5_K_XL / Q8_K_XL, 89.5% on GLM-4.7-Flash Q4_K_M, 83% on gpt-oss-20b Q6_K_XL, 97.5% on gpt-oss-20b at d32768. Requires `--load-mode mmap` (default). C API: `llama_moe_residency_enable`, `llama_moe_residency_disable`, `llama_moe_residency_stats_get`. See [`docs/moe-expert-residency.md`](docs/moe-expert-residency.md).
-
-**MoE expert offload to host RAM (`--cpu-moe`).** Routes MoE FFN expert tensors to host RAM via `tensor_buft_overrides` (LLM_FFN_EXPS_REGEX) while keeping attention/embedding layers on the GPU. Combined with residency, lets you run 30-90 GB Q5_K_XL / Q8_K_XL MoE quants on hardware with 32 GB or less of unified memory - the rest stays mmap'd on SSD, only the LRU-resident expert subset lives in RAM.
+**MoE expert activation tracking.** HTTP endpoints (`/expert-stats`, `/expert-tracking`) plus a C API (`llama_expert_tracking_enable`, `llama_expert_stats_get`, `llama_model_n_expert`, `llama_model_n_expert_used`) for reading per-layer expert activation counts in real time. Instrumentation only - no compute changes. This is Phase 1 of a planned expert tiering design.
 
 **APU/iGPU Vulkan tuning.** Automatic `nodes_per_submit` reduction for RDNA3 iGPUs (the default upstream value is tuned for discrete GPUs and starves the shader engine on shared-memory APUs). Manual override via `GGML_VK_NODES_PER_SUBMIT`.
 
-**Quantized-KV flash-attention prefill (Strix Halo / RDNA3.5).** Backports [ggml-org/llama.cpp#25494](https://github.com/ggml-org/llama.cpp/pull/25494) with a CachyLLama memory gate. The coopmat1 FA path re-dequantizes the quantized K/V cache inside every Q workgroup on every prefill step - fine on a discrete GPU with a big L2, brutal on shared-memory UMA. The fix dequantizes+transposes into a per-head-contiguous f16 scratch once per layer, then runs the coalesced f16 FA. The PR author measured pp512 +41% on Qwen3-Coder-30B-A3B Q6_K at d32768 on Strix Halo (200.17 -> 281.99 t/s, byte-identical output vs stock). Three runtime controls: `GGML_VK_NO_FA_SCRATCH_TRANSPOSE=1` disables, `GGML_VK_FA_SCRATCH_SAFETY_MB=N` tunes the safety margin (default 1024 MiB), `GGML_VK_FA_SCRATCH_FORCE=1` bypasses the host-RAM check. The gate uses `common::host_available_ram()` so 32 GB boxes with long context automatically fall back to the slow path instead of OOMing.
+**Quantized-KV flash-attention prefill (Strix Halo / RDNA3.5).** Backports [ggml-org/llama.cpp#25494](https://github.com/ggml-org/llama.cpp/pull/25494) with a CachyLLama memory gate. The coopmat1 FA path re-dequantizes the quantized K/V cache inside every Q workgroup on every prefill step - fine on a discrete GPU with a big L2, brutal on shared-memory UMA. The fix dequantizes+transposes into a per-head-contiguous f16 scratch once per layer, then runs the coalesced f16 FA. On Strix Halo (gfx1151) Qwen3-Coder-30B-A3B q8_0 at 32k context: pp512 +41%, tg +129% vs stock. Three runtime controls: `GGML_VK_NO_FA_SCRATCH_TRANSPOSE=1` disables, `GGML_VK_FA_SCRATCH_SAFETY_MB=N` tunes the safety margin (default 1024 MiB), `GGML_VK_FA_SCRATCH_FORCE=1` bypasses the host-RAM check. The gate uses `common::host_available_ram()` so 32 GB boxes with long context automatically fall back to the slow path instead of OOMing.
 
-**CPU ISA auto-detection.** The upstream Vulkan build defaults to `GGML_NATIVE=OFF` and `GGML_AVX512=OFF`, leaving AVX-512 code paths compiled out on Zen 4 hardware that supports them. The CachyLLama parent project's `scripts/detect-gpu.sh` reads `/proc/cpuinfo` (or `sysctl` on macOS), picks the highest ISA level the CPU supports (`avx512_bf16` on Zen 4, `avx512_vnni` on Sapphire Rapids, `avx2` on Zen 3, etc.), and `scripts/rebuild.sh` wires the matching `-DGGML_AVX512=ON -DGGML_AVX512_BF16=ON` flags into the cmake invocation.
+**CPU ISA auto-detection.** The upstream Vulkan build defaults to `GGML_NATIVE=OFF` and `GGML_AVX512=OFF`, leaving AVX-512 code paths compiled out on Zen 4 hardware that supports them (5-15% gen speedup on Vulkan, 30-100% on CPU-offloaded layers). CachyLLama's build wrapper reads `/proc/cpuinfo` and enables the right ISA level for the detected CPU.
 
 **Checkpoint matching for cross-conversation safety.** When a checkpoint's recurrent state was computed from a different conversation, restoring it produces garbage. CachyLLama's search layer classifies matches as same-conversation (recurrent state is content-accurate, accept any size) or cross-conversation (only restore checkpoints whose `n_tokens` fits within the common prefix). Overflow handling caps `n_past` to leave room for new token evaluation instead of resetting.
 
@@ -46,17 +42,17 @@ A 30B MoE model with 3B active parameters fits on an APU with shared memory (6 G
 
 The bottleneck on APUs isn't generation speed. It's prompt evaluation. Every API call in an agentic workflow re-sends 18-30K tokens of system prompt, tool definitions, and prior conversation context. On a 780M iGPU that's 3-5 minutes of pure re-evaluation before the first token appears.
 
-CachyLLama's KV cache collapses that to a fraction of a second. With MoE expert residency, the static prefix hits at 15,700+ tokens restored from SSD in 0.5 s warm; only the divergent tail needs evaluation.
+CachyLLama's KV cache collapses that to 1-4 seconds. The static prefix (system prompt, tool definitions) hits at 17,800+ tokens restored from SSD; only the divergent tail needs evaluation.
 
-Benchmarks (Ayaneo Flip KB, 7840U / 780M / 32 GB, Vulkan, Qwen3.6-35B-A3B Q4_K_XL, 128 output tokens, CachyLLama 8edfad218):
+Benchmarks (Ayaneo Flip KB, 7840U / 780M / 32 GB, Vulkan, Qwen3.6-35B-A3B Q4_K_XL, 128 output tokens):
 
 | Prompt size | Cold TTFT | Warm TTFT | Speedup |
 |------|-----------|-----------|---------|
-| 1,244 tokens | 6.15 s | 0.23 s | 26.4x |
-| 5,411 tokens | 26.68 s | 0.29 s | 91.1x |
-| 15,723 tokens | 84.02 s | 0.47 s | 179.1x |
+| ~1,243 tokens | 9.3 s | 0.41 s | 23.0x |
+| ~5,409 tokens | 43.3 s | 0.57 s | 76.2x |
+| ~15,700 tokens | 143.1 s (2.4 min) | 0.99 s | 144.5x |
 
-Cold prompt eval rate: 188-204 t/s. Warm cache hit restores 15,719 of 15,723 tokens from disk - only 4 tokens require fresh evaluation. Full benchmark data (per-tier breakdowns, Strix Halo / 8060S) in the [parent project](https://github.com/fewtarius/llama-ai#benchmarking).
+Cold prompt eval rate: 109.9-133.4 t/s. Cached: 15,717/15,721 tokens restored from disk (4 tokens evaluated). Full benchmark data in the [parent project](https://github.com/fewtarius/llama-ai#benchmarking).
 
 ## CachyLLama CLI flags
 
@@ -107,20 +103,6 @@ To identify a request, pass `llama_user_id` in the request body. OpenAI SDK call
 | Flag | Default | Description |
 |------|---------|-------------|
 | `GGML_VK_NODES_PER_SUBMIT` | auto | Override automatic `nodes_per_submit` (lower values feed RDNA3 iGPUs more frequently) |
-
-### MoE expert residency / offload
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--moe-expert-residency` / `--no-moe-expert-residency` | disabled | Master switch. Tracks MoE expert activations and uses `madvise` to keep hot experts paged into RAM and cold ones released back to the mmap'd file. Requires `--load-mode mmap` (default). |
-| `--moe-resident-per-layer N` | 128 | Max experts kept hot per MoE layer (per-layer LRU size). Must be > 0. |
-| `--moe-prewarm-top-k N` | 16 | Experts to prewarm per layer at startup. Set to 0 to disable prewarm. |
-| `--cpu-moe` | disabled | Route all MoE FFN expert tensors to host RAM via `tensor_buft_overrides` (LLM_FFN_EXPS_REGEX). Combine with `--moe-expert-residency` on memory-constrained hardware to mmap the full weights from SSD while keeping only the LRU-resident expert subset in RAM. |
-| `--n-cpu-moe N` | 0 | Route only the first N MoE layers' expert weights to host RAM (0 = use `--cpu-moe` value). |
-
-Environment-variable equivalents: `LLAMA_ARG_MOE_EXPERT_RESIDENCY`, `LLAMA_ARG_MOE_RESIDENT_PER_LAYER`, `LLAMA_ARG_MOE_PREWARM_TOP_K`, `LLAMA_ARG_CPU_MOE`, `LLAMA_ARG_N_CPU_MOE`.
-
-Hit rate and latency data per model is in [`docs/moe-expert-residency.md`](docs/moe-expert-residency.md) (Tables 1-2: per-model hit rate and per-prompt latency breakdowns).
 
 ### Quantized-KV flash-attention scratch control (Strix Halo)
 
@@ -208,7 +190,6 @@ All standard `llama.cpp` build options are supported. CachyLLama adds no new bui
 - [CachyLLama parent project](https://github.com/fewtarius/llama-ai) - runner scripts, GPU detection, benchmarks, end-to-end install
 - [CLIO](https://github.com/SyntheticAutonomicMind/CLIO) - agentic AI client optimized for CachyLLama's persistent cache
 - [User isolation design](docs/development/user-isolation-design.md) - architecture for the `user_id` / `u/` namespace / `--max-concurrent-per-user` features
-- [MoE expert residency](docs/moe-expert-residency.md) - `--moe-expert-residency` / `--cpu-moe` mechanism, hit rate measurements, C API (`llama_moe_residency_*`)
 - [Upstream llama.cpp](https://github.com/ggml-org/llama.cpp) - the base project we fork from
 
 ## License
