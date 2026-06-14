@@ -1,16 +1,206 @@
-# llama.cpp
+# CachyLLama
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) focused on running local LLM inference on lower-spec hardware - AMD APUs, integrated GPUs, handhelds, anything with shared system memory. CachyLLama adds a persistent on-disk KV cache so agentic AI workloads (where every request re-sends thousands of tokens of system prompt and tool definitions) stay usable when the model has to evaluate prompts on hardware that can only generate 5-20 tokens per second.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp)](https://github.com/ggml-org/llama.cpp/releases)
-[![Server](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Upstream: ggml-org/llama.cpp](https://img.shields.io/badge/upstream-ggml--org%2Fllama.cpp-orange.svg)](https://github.com/ggml-org/llama.cpp)
+[![Parent project: fewtarius/llama-ai](https://img.shields.io/badge/parent-fewtarius%2Fllama--ai-green.svg)](https://github.com/fewtarius/llama-ai)
 
-[Manifesto](https://github.com/ggml-org/llama.cpp/discussions/205) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Abartowski1182%20OR%20author%3Ahipudding%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3A0cc4m%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc)
+[CachyLLama parent project](https://github.com/fewtarius/llama-ai) / [CLIO agentic client](https://github.com/SyntheticAutonomicMind/CLIO) / [Upstream llama.cpp](https://github.com/ggml-org/llama.cpp) / [ggml](https://github.com/ggml-org/ggml)
 
-LLM inference in C/C++
+## What CachyLLama is
+
+CachyLLama is the C++ inference engine in the [CachyLLama ecosystem](https://github.com/fewtarius/llama-ai). It tracks upstream `llama.cpp` master closely and includes everything upstream supports. The CachyLLama additions target one specific use case: agentic AI on AMD APU hardware where prompt evaluation dominates total response time.
+
+If you want the runner scripts, GPU/CPU detection, benchmark harness, and the end-to-end install, use the [parent project](https://github.com/fewtarius/llama-ai). If you want just the inference engine with the persistent KV cache and the hybrid-MoE fixes, you're in the right place.
+
+## How CachyLLama is different from upstream
+
+We're not faster at inference. We don't support more models. We don't add new quantization types. We do one thing that upstream doesn't: we make the workloads that lower-spec devices can actually run - persistent, multi-turn agentic sessions with 18-30K-token static prefixes - viable by caching aggressively.
+
+**Persistent SSD-backed KV cache.** Conversation state survives server restarts and power cycles. Hot/warm/cold tiering keeps active conversations in RAM, demotes idle ones to disk, and restores from disk on cold start. Per-conversation ring buffer prevents unbounded disk growth. Kernel readahead (`posix_fadvise` on Linux, `readahead` on macOS) overlaps SSD I/O with CPU work. Conversation hash and model compatibility hash prevent mismatched checkpoint restoration. The `caché` in CachyLLama.
+
+**System prompt cache.** Global, cross-conversation cache keyed on the first N tokens of any prompt. First eval writes the state; subsequent requests skip the entire system prompt re-evaluation. Works for both standard transformer and hybrid (MoE/SSM) models - the per-position recurrent state in the state file means a state saved after the full prompt can be restored with `n_past` capped to the system prompt boundary. Default: 8 entries per model, 30 days unused before expiry.
+
+**Hybrid MoE checkpoint restore (Qwen3.5/3.6, Gemma 4, GLM-4.7).** Hybrid architectures combine attention cells with a recurrent state, and the recurrent state covers all positions in the prompt regardless of how the attention cells are split. CachyLLama tracks recurrent state separately from attention cells, uses `n_tokens`-based matching when searching for checkpoints, and exposes `llama_memory_seq_rm_attn_only` to clear attention cells without disturbing recurrent state. MLA support for DeepSeek2/DeepSeek3 included.
+
+**User isolation.** `user_id` as a first-class request parameter. Routes checkpoints to a `u/` namespace on disk. Per-user concurrency cap with HTTP 429 enforcement. Slot affinity (allocation prefers slots already owned by the requesting user for cache locality). OpenAI SDK compatible via `extra_body`. See [`docs/development/user-isolation-design.md`](docs/development/user-isolation-design.md).
+
+**MoE expert activation tracking.** HTTP endpoints (`/expert-stats`, `/expert-tracking`) plus a C API (`llama_expert_tracking_enable`, `llama_expert_stats_get`, `llama_model_n_expert`, `llama_model_n_expert_used`) for reading per-layer expert activation counts in real time. Instrumentation only - no compute changes. This is Phase 1 of a planned expert tiering design.
+
+**APU/iGPU Vulkan tuning.** Automatic `nodes_per_submit` reduction for RDNA3 iGPUs (the default upstream value is tuned for discrete GPUs and starves the shader engine on shared-memory APUs). Manual override via `GGML_VK_NODES_PER_SUBMIT`.
+
+**Quantized-KV flash-attention prefill (Strix Halo / RDNA3.5).** Backports [ggml-org/llama.cpp#25494](https://github.com/ggml-org/llama.cpp/pull/25494) with a CachyLLama memory gate. The coopmat1 FA path re-dequantizes the quantized K/V cache inside every Q workgroup on every prefill step - fine on a discrete GPU with a big L2, brutal on shared-memory UMA. The fix dequantizes+transposes into a per-head-contiguous f16 scratch once per layer, then runs the coalesced f16 FA. On Strix Halo (gfx1151) Qwen3-Coder-30B-A3B q8_0 at 32k context: pp512 +41%, tg +129% vs stock. Three runtime controls: `GGML_VK_NO_FA_SCRATCH_TRANSPOSE=1` disables, `GGML_VK_FA_SCRATCH_SAFETY_MB=N` tunes the safety margin (default 1024 MiB), `GGML_VK_FA_SCRATCH_FORCE=1` bypasses the host-RAM check. The gate uses `common::host_available_ram()` so 32 GB boxes with long context automatically fall back to the slow path instead of OOMing.
+
+**CPU ISA auto-detection.** The upstream Vulkan build defaults to `GGML_NATIVE=OFF` and `GGML_AVX512=OFF`, leaving AVX-512 code paths compiled out on Zen 4 hardware that supports them (5-15% gen speedup on Vulkan, 30-100% on CPU-offloaded layers). CachyLLama's build wrapper reads `/proc/cpuinfo` and enables the right ISA level for the detected CPU.
+
+**Checkpoint matching for cross-conversation safety.** When a checkpoint's recurrent state was computed from a different conversation, restoring it produces garbage. CachyLLama's search layer classifies matches as same-conversation (recurrent state is content-accurate, accept any size) or cross-conversation (only restore checkpoints whose `n_tokens` fits within the common prefix). Overflow handling caps `n_past` to leave room for new token evaluation instead of resetting.
+
+## Why this matters on lower-spec hardware
+
+A 30B MoE model with 3B active parameters fits on an APU with shared memory (6 GB VRAM + 18 GB GTT = 24 GB GPU memory). Generation runs at 5-20 tokens per second on a 780M - acceptable for typing, painful when the model is reading its own tool outputs.
+
+The bottleneck on APUs isn't generation speed. It's prompt evaluation. Every API call in an agentic workflow re-sends 18-30K tokens of system prompt, tool definitions, and prior conversation context. On a 780M iGPU that's 3-5 minutes of pure re-evaluation before the first token appears.
+
+CachyLLama's KV cache collapses that to 1-4 seconds. The static prefix (system prompt, tool definitions) hits at 17,800+ tokens restored from SSD; only the divergent tail needs evaluation.
+
+Benchmarks (Ayaneo Flip KB, 7840U / 780M / 32 GB, Vulkan, Qwen3.6-35B-A3B Q4_K_XL, 128 output tokens):
+
+| Prompt size | Cold TTFT | Warm TTFT | Speedup |
+|------|-----------|-----------|---------|
+| ~1,243 tokens | 9.3 s | 0.41 s | 23.0x |
+| ~5,409 tokens | 43.3 s | 0.57 s | 76.2x |
+| ~15,700 tokens | 143.1 s (2.4 min) | 0.99 s | 144.5x |
+
+Cold prompt eval rate: 109.9-133.4 t/s. Cached: 15,717/15,721 tokens restored from disk (4 tokens evaluated). Full benchmark data in the [parent project](https://github.com/fewtarius/llama-ai#benchmarking).
+
+## CachyLLama CLI flags
+
+### SSD cache
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--cache-ssd PATH` | (off) | Enable SSD-backed KV cache |
+| `--cache-ssd-checkpoints N` | 64 | Max checkpoints per slot |
+| `--cache-ssd-hot-window N` | 16384 | Always-keep window in tokens |
+| `--cache-ssd-warm-window N` | 32768 | Keep-in-RAM window in tokens |
+| `--cache-ssd-max-cold N` | 0 | Max cold tier checkpoints (0 = unlimited) |
+| `--cache-ssd-page-size N` | 1024 | Tokens per page (512 / 1024 / 2048) |
+| `--cache-ssd-max-conversations N` | 16 | Max conversation directories |
+| `--cache-ssd-hot-ram N` | auto | Hot tier RAM budget in MiB (0 = auto) |
+| `--cache-ssd-warm-ram N` | auto | Warm tier RAM budget in MiB (0 = auto) |
+| `--cache-ssd-cold-maxsize N` | 0 | Global cap on total cold tier bytes across all conversations in MiB (0 = unlimited). When exceeded, oldest conversations are evicted as whole directories. |
+
+### System prompt cache
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--cache-ssd-system-prompts N` | 8 | Max global system prompt entries cached for reuse across conversations |
+| `--cache-ssd-system-max-days N` | 30 | Expire system prompt entries unused for N days |
+
+### User isolation
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--max-concurrent-per-user N` | 0 | Per-user slot cap (0 = unlimited) |
+
+When the cap is hit, the server returns HTTP 429:
+
+```json
+{
+  "error": {
+    "code": 429,
+    "message": "User 'tenant-42-user-7' has reached the concurrent request limit (2)",
+    "type": "rate_limit_error"
+  }
+}
+```
+
+To identify a request, pass `llama_user_id` in the request body. OpenAI SDK callers use `extra_body={"llama_user_id": "..."}`. Validated to `^[a-zA-Z0-9\-_]+$` with a 512-char ceiling.
+
+### Vulkan APU/iGPU tuning
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `GGML_VK_NODES_PER_SUBMIT` | auto | Override automatic `nodes_per_submit` (lower values feed RDNA3 iGPUs more frequently) |
+
+### Quantized-KV flash-attention scratch control (Strix Halo)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `GGML_VK_NO_FA_SCRATCH_TRANSPOSE` | (unset) | Set to `1` to disable the dequant+transpose scratch entirely. Use this if you see OOM on long-context prefills with quantized KV cache. |
+| `GGML_VK_FA_SCRATCH_SAFETY_MB` | 1024 | MiB of host-RAM headroom the scratch allocator requires before allocating. Higher = stricter. |
+| `GGML_VK_FA_SCRATCH_FORCE` | (unset) | Set to `1` to bypass the host-RAM check. The scratch will be allocated regardless. |
+
+The gate runs at every prefill step when K and V are both quantized (q8_0 or q4_0 today), N is at least 64 (prefill, not decode), and the tensors are contiguous. If `required_scratch + GGML_VK_FA_SCRATCH_SAFETY_MB > MemAvailable`, the slow coopmat1 path runs instead and a one-time warning is logged. The scratch size grows with context: ~256 MiB at 128k for head_dim 128 (Qwen3-Coder-30B-A3B), ~512 MiB at 128k for head_dim 256 (Qwen3.6-35B-A3B). Tracked upstream as [ggml-org/llama.cpp#25494](https://github.com/ggml-org/llama.cpp/pull/25494).
+
+## MoE expert tracking API
+
+### `GET /expert-stats`
+
+Per-layer expert activation counts, frequencies, and token counts:
+
+```json
+{
+  "n_expert": 256,
+  "n_expert_used": 8,
+  "total_tokens": 1500,
+  "tracking_enabled": true,
+  "layers": [
+    {
+      "layer": 0,
+      "activations": [
+        {"expert": 42, "count": 150, "frequency": 0.0125},
+        {"expert": 7,  "count": 148, "frequency": 0.0123}
+      ]
+    }
+  ]
+}
+```
+
+### `POST /expert-tracking`
+
+Enable/disable tracking and optionally reset counters:
+
+```json
+{"enabled": true, "reset": true}
+```
+
+### C API
+
+```c
+llama_expert_tracking_enable(ctx, true);
+
+// Per-layer stats (returns 0 on success, -1 if tracking disabled)
+struct llama_expert_stats stats;
+llama_expert_stats_get(ctx, /*layer=*/0, &stats);
+
+// Reset all counters
+llama_expert_stats_reset(ctx);
+
+// Model-level constants
+int32_t n_expert      = llama_model_n_expert(model);
+int32_t n_expert_used = llama_model_n_expert_used(model);
+```
+
+The `llama_expert_stats` struct exposes `activations[]` (per-expert count and frequency) and `token_count` for the layer.
+
+
+## Building CachyLLama
+
+For end-to-end install (runner scripts, GPU detection, benchmark harness, GTT configuration), use the [parent project](https://github.com/fewtarius/llama-ai):
+
+```bash
+git clone --recurse-submodules https://github.com/fewtarius/llama-ai.git
+cd llama-ai
+./scripts/rebuild.sh
+```
+
+To build just the inference engine from this repo:
+
+```bash
+cmake -B build
+cmake --build build --config Release -j$(nproc)
+```
+
+All standard `llama.cpp` build options are supported. CachyLLama adds no new build flags - everything is runtime config via the CLI flags above.
+
+## Documentation
+
+- [CachyLLama parent project](https://github.com/fewtarius/llama-ai) - runner scripts, GPU detection, benchmarks, end-to-end install
+- [CLIO](https://github.com/SyntheticAutonomicMind/CLIO) - agentic AI client optimized for CachyLLama's persistent cache
+- [User isolation design](docs/development/user-isolation-design.md) - architecture for the `user_id` / `u/` namespace / `--max-concurrent-per-user` features
+- [Upstream llama.cpp](https://github.com/ggml-org/llama.cpp) - the base project we fork from
+
+## License
+
+Source code: MIT-licensed (upstream `llama.cpp` base, see [LICENSE](LICENSE), Copyright (c) 2023-2026 The ggml authors). The CachyLLama additions are released under the same terms unless otherwise noted; see the [CachyLLama parent project](https://github.com/fewtarius/llama-ai) for the full project license.
+
+---
+
+# The upstream `llama.cpp` README
+
+Everything below this point is the unmodified upstream `llama.cpp` README. CachyLLama is a fork of `llama.cpp`; the rest of the file documents the base project, its supported models, and its build options. The CachyLLama additions are described in the sections above.
 
 ## Recent API changes
 
