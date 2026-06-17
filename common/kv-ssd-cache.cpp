@@ -148,8 +148,9 @@ static void ckpt_readahead(kv_ssd_cache* c, uint64_t id) {
 
 #ifdef __linux__
     posix_fadvise(fd, 0, total_size, POSIX_FADV_WILLNEED);
+/// macOS does not expose readahead(); use fcntl(F_RDADVISE) instead.
 #elif defined(__APPLE__)
-    readahead(fd, 0, total_size);
+    (void)fcntl(fd, F_RDADVISE, (void *)(intptr_t)total_size);
 #endif
 
     close(fd);
