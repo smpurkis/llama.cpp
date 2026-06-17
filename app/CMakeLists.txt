@@ -15,6 +15,9 @@ target_link_libraries(${TARGET} PRIVATE
 )
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+# Fix include path for build-info.h (lives in common/).
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/common)
+
 # Automatically add all files from the 'licenses' directory
 file(GLOB EXTRA_LICENSES "${CMAKE_SOURCE_DIR}/licenses/LICENSE-*")
 

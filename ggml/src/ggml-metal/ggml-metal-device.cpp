@@ -1785,8 +1785,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col(ggml_meta
     GGML_ASSERT(op->type         == GGML_TYPE_F16 || op->type == GGML_TYPE_F32);
 
     const bool is_2D = ((const int32_t *)(op->op_params))[6] == 1;
-    const int64_t KH = is_2D ? ne01 : 1;
-    const int64_t KW = ne00;
+    const int64_t KH = is_2D ? op->src[1]->ne[1] : 1;
+    const int64_t KW = op->src[1]->ne[0];
 
     char base[256];
     char name[256];
