@@ -2373,6 +2373,24 @@ private:
         n_past = boundary;
         slot.truncated = true;
 
+        // Skip restore if the system section is too small to be useful.
+        // The system prompt cache is for cross-conversation reuse of
+        // meaningful system prompts. When the chat template adds only
+        // a header (no actual system message), boundary is tiny and
+        // restoring it prevents the per-conversation SSD cache from
+        // being tried (which would restore the full prompt state).
+        // Fall through to the SSD cache in that case.
+        constexpr int32_t MIN_USEFUL_SYS_TOKENS = 16;
+        if (boundary < MIN_USEFUL_SYS_TOKENS) {
+            SLT_DBG(slot, "system prompt cache: boundary %d < %d, "
+                    "falling through to SSD cache\n",
+                    boundary, MIN_USEFUL_SYS_TOKENS);
+            common_context_seq_rm(ctx_tgt, slot.id, -1, -1);
+            slot.prompt.tokens.clear();
+            n_past = 0;
+            return false;
+        }
+
         // Record which system prompt this slot is using so we don't
         // re-extract on every decode loop iteration.
         slot_sys_hash[slot.id] = kv_ssd_system_cache::hash_tokens(
