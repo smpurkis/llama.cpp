@@ -14,6 +14,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <cstdio>
+#include <cctype>
 #include <ctime>
 #include <dirent.h>
 #include <fcntl.h>
@@ -483,6 +484,45 @@ size_t kv_ssd_system_cache::bytes() const {
 // =============================================================================
 
 namespace {
+// Check if a token's decoded text indicates a role/structure marker
+// (as opposed to a true end-of-generation token). Some vocabularies
+// (GLM-4, Gemma) classify role tokens like <|system|>, <|user|>,
+// <|assistant|> as EOG. We need to distinguish these from actual
+// section-closing tokens like <|im_end|>, <|end_of_turn|>, <|eot_id|>.
+//
+// Substring match is sufficient here because:
+//   - Role markers are short special tokens (<|user|>, <|system|>, etc.)
+//   - The role name substring only appears in role markers, not in
+//     typical system prompt content (and even if it does, the worst
+//     case is a slightly shorter cached system prompt - still works)
+static bool is_role_marker_text(const std::string& text) {
+    if (text.empty()) return false;
+    if (text.find("system")    != std::string::npos) return true;
+    if (text.find("user")      != std::string::npos) return true;
+    if (text.find("assistant") != std::string::npos) return true;
+    if (text.find("human")     != std::string::npos) return true;
+    if (text.find("model")     != std::string::npos) return true;
+    if (text.find("tool")      != std::string::npos) return true;
+    if (text.find("function")  != std::string::npos) return true;
+    if (text.find("[INST]")    != std::string::npos) return true;
+    return false;
+}
+
+// Decode a token to text using the vocab. Special tokens are rendered
+// (e.g. <|im_start|>) so we can match role markers by their text.
+// Returns empty string on error.
+static std::string decode_token_for_boundary(
+    const llama_vocab* vocab,
+    llama_token token)
+{
+    char buf[256];
+    int n = llama_token_to_piece(vocab, token, buf, sizeof(buf), 0, true);
+    if (n <= 0) {
+        n = llama_token_to_piece(vocab, token, buf, sizeof(buf), 0, false);
+    }
+    if (n <= 0) return "";
+    return std::string(buf, n);
+}
 
 // Try to detect the system prompt end in tokens[0..n_tokens] using a
 // template-aware scan. We look for the first occurrence of one of these
@@ -529,73 +569,122 @@ int32_t kv_detect_system_prompt_boundary(
 {
     if (!vocab || !tokens || n_tokens <= 0) return 0;
 
-    // Phase 1: template-aware scan. Look at the first few tokens to identify
-    // the system role marker, then find the matching end marker.
-
-    // Most chat templates start the system section with a sequence like
-    // <|im_start|>, system, \n. After the system content, the end marker
-    // (e.g. <|im_end|>) closes the section.
+    // Two-phase boundary detection. We compute a candidate boundary from
+    // each phase and return the minimum. The minimum is the most
+    // conservative (smallest) system prompt, which is the original
+    // design intent: cache just the system section, nothing more.
     //
-    // We assume:
-    //   tokens[0] = role-start token (e.g. <|im_start|>)
-    //   tokens[1] = role name (e.g. "system")
+    // Phase 1: find the first user-role marker token. The user role
+    //   marker is a special token whose decoded text contains "user" or
+    //   "human" (case-insensitive). This is the most reliable method
+    //   because the user role name is always present in any chat
+    //   template that has a user/assistant turn structure, regardless
+    //   of whether the template uses EOG to close the system section.
     //
-    // We then search for the first end-marker token after that.
-
-    // (chat_template_hint is currently unused - reserved for future use
-    //  when we add explicit template-name dispatch.)
-
-    // The end of the system section is the first EOG token after the
-    // system role marker.
+    //   Works for: GLM (<|user|>), Gemma (text "user"), Llama-3
+    //   (text "user"), ChatML (text "user"), Command-R, etc.
     //
-    // We accept any of: <|im_start|>, <|start_header_id|>, <start_of_turn>,
-    // or [INST]. We do this by trying to decode tokens[0] and checking
-    // for these strings.
+    //   We use llama_vocab_is_control() to filter out regular content
+    //   tokens that happen to contain "user" in their text (e.g. a
+    //   system prompt that says "user-facing assistant"). Control
+    //   tokens are always special/structural, never content words.
+    //   We also accept the text "user" or "User" etc. as exact matches
+    //   for templates like Llama-3 where "user" is a regular text
+    //   token (not a control token) but is still a role marker by
+    //   position.
     //
-    // Simpler approach: just look for the first EOG token and assume the
-    // first EOG is the end of the system section. This works for most
-    // chat templates where the system section is always first and always
-    // closed by an EOG token.
+    // Phase 2: EOG-based detection, skipping role-marker EOGs. This
+    //   preserves the original behavior for templates where the
+    //   system section is closed by a true EOG token (<|im_end|>,
+    //   <|end_of_turn|>, <|eot_id|>, etc.) and the role tokens
+    //   themselves are NOT classified as EOG (ChatML, Llama-3, standard
+    //   Gemma).
+    int32_t boundary_user = n_tokens;
+    int32_t boundary_eog  = n_tokens;
 
-    // Walk forward from the start, skipping the role header tokens. We
-    // assume the role header is at most 5 tokens (e.g. <|im_start|>, system,
-    // \n for ChatML). For Llama-3 it's <|start_header_id|>, system,
-    // <|end_header_id|>, \n.
-    const int ROLE_HEADER_MAX = 6;
+    // Phase 1: find first user-role marker token
+    // Start from i=1 (skip BOS). The preceding-control-token check
+    // filters out content words that happen to be "user" or "human".
+    // Starting from i=2 would miss templates where the user role
+    // marker is at position 1 (Qwen3.6 with no system section:
+    // <|im_start|>user\n...).
+    for (int i = 1; i < n_tokens; i++) {
+        std::string text = decode_token_for_boundary(vocab, tokens[i]);
+        if (text.empty()) continue;
 
-    for (int i = 0; i < ROLE_HEADER_MAX && i < n_tokens; i++) {
-        if (llama_vocab_is_eog(vocab, tokens[i])) {
-            // Hit an EOG before the system content - probably a BOS or
-            // something unusual. Skip and continue.
+        // Case-insensitive substring match for "user" or "human"
+        std::string lower;
+        lower.reserve(text.size());
+        for (char c : text) {
+            lower.push_back((char)std::tolower((unsigned char)c));
+        }
+        bool is_user_text = (lower.find("user")   != std::string::npos ||
+                             lower.find("human")  != std::string::npos);
+        if (!is_user_text) continue;
+
+        // Filter false positives: if the token is NOT a control/special
+        // token AND not an exact match for a known user-role text, it's
+        // probably content (e.g. "user_name" in the system prompt).
+        // For control tokens, the role-marker interpretation is correct.
+        // For exact text matches like "user" or "User", the role-marker
+        // interpretation is correct ONLY if the preceding token is a
+        // role-start control token (ChatML: <|im_start|>user, Llama-3:
+        // <|start_header_id|>user). Without this check, content that
+        // contains the word "user" (e.g. "user-facing" or a 19th-century
+        // novel that uses the word) gets falsely identified as a role
+        // marker, and the boundary lands inside the user content.
+        bool is_control = llama_vocab_is_control(vocab, tokens[i]);
+        bool is_exact_role = (text == "user" || text == "User" ||
+                              text == "USER" || text == "Human" ||
+                              text == "human" || text == "H" ||
+                              text == "<|user|>" || text == "<|USER|>");
+
+        if (is_control) {
+            // Control token with "user" in text - always a role marker
+            // (e.g. GLM's <|user|>, Gemma's <|user|>)
+        } else if (is_exact_role) {
+            // Exact text match (e.g. plain "user" token in ChatML/Llama-3)
+            // - verify preceded by a role-start control token
+            if (i < 1 || !llama_vocab_is_control(vocab, tokens[i-1])) {
+                continue;  // Content word "user", not a role marker
+            }
+        } else {
+            // Substring match but not control and not exact - content
+            // (e.g. "users", "user-facing"). Skip.
             continue;
         }
-        // Check if this is an EOG (system end marker)
-        // We need to look for the EOG AFTER some system content, not at
-        // the role header. So skip ROLE_HEADER_MAX tokens first.
-        if (i < 1) continue;  // always skip token 0 (the role-start)
 
-        // Check the remaining tokens in [i+1..n] for the first EOG
-        for (int j = i + 1; j < n_tokens; j++) {
-            if (llama_vocab_is_eog(vocab, tokens[j])) {
-                // j is the end-marker token. The system section ends
-                // AFTER j, so the boundary is j+1.
-                return j + 1;
-            }
-        }
-        // If we didn't find an EOG after this position, fall through to
-        // the next attempt.
+        boundary_user = i;
         break;
     }
 
-    // Phase 2: fall back to scanning the entire prompt for the first
-    // EOG token. If the very first token is an EOG, there's no system
-    // section (treat the whole prompt as non-system content).
-    for (int i = 0; i < n_tokens; i++) {
+    // Phase 2: EOG-based detection, skipping role-marker EOGs
+    const int ROLE_HEADER_MAX = 6;
+    int scan_start = 0;
+    for (int i = 0; i < ROLE_HEADER_MAX && i < n_tokens; i++) {
         if (llama_vocab_is_eog(vocab, tokens[i])) {
-            return i + 1;
+            continue;
         }
+        if (i < 1) continue;  // always skip token 0
+        scan_start = i + 1;
+        break;
     }
 
-    // No EOG found - treat the whole prompt as one section.
-    return n_tokens;
+    const int MAX_SYSTEM_SCAN = 64;
+    int scan_end = std::min(scan_start + MAX_SYSTEM_SCAN, n_tokens);
+    for (int j = scan_start; j < scan_end; j++) {
+        if (!llama_vocab_is_eog(vocab, tokens[j])) continue;
+        // Skip role-marker EOGs (GLM/Gemma classify role tokens as EOG)
+        std::string text = decode_token_for_boundary(vocab, tokens[j]);
+        if (is_role_marker_text(text)) continue;
+        boundary_eog = j + 1;
+        break;
+    }
+
+    // Return the minimum - most conservative system prompt boundary.
+    // This preserves original behavior for templates that work
+    // (ChatML, Llama-3, standard Gemma) and fixes GLM/Gemma where the
+    // original returned n_tokens (no cache) or a tiny boundary (3-7
+    // tokens of chat template header).
+    return std::min(boundary_user, boundary_eog);
 }
