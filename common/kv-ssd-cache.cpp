@@ -31,7 +31,6 @@
 static const uint32_t KV_SSD_MAGIC_INDEX = 0x4B564944; // "KVID"
 static const uint32_t KV_SSD_MAGIC_REC   = 0x4B565243; // "KVRC"
 static const uint32_t KV_SSD_VERSION     = 2;           // v2 = per-file format
-static const size_t   KV_SSD_INDEX_SIZE  = 4096;
 
 // =============================================================================
 // Internal helpers
@@ -779,7 +778,7 @@ uint64_t kv_ssd_find_match(kv_ssd_cache* cache,
 
     for (const auto& [id, ckpt] : cache->index) {
         if (cache->compat_hash != 0 && ckpt.compat_hash != cache->compat_hash) continue;
-        if (max_n_tokens > 0 && ckpt.n_tokens >= max_n_tokens) continue;
+        if (max_n_tokens > 0 && ckpt.n_tokens > max_n_tokens) continue; // skip checkpoints larger than task
 
         // Compute longest common prefix with stored token prefix
         const size_t cmp_count = std::min(tokens_size, ckpt.token_prefix.size());

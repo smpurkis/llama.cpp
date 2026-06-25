@@ -156,8 +156,8 @@ bool kv_ssd_system_cache::init(const std::string& model_dir, uint64_t compat_has
 
     initialized = true;
 
-    LOG_INF("system cache: initialized at %s (entries=%zu, bytes=%.1f MiB, rejected=%zu, max_entries=%zu, max_unused_days=%d)\n",
-            model_dir_.c_str(), entries_.size(),
+    LOG_INF("system cache: initialized at %s (loaded=%zu, entries=%zu, bytes=%.1f MiB, rejected=%zu, max_entries=%zu, max_unused_days=%d)\n",
+            model_dir_.c_str(), loaded, entries_.size(),
             (double)bytes_ / (1024.0 * 1024.0),
             rejected, max_entries, max_unused_days);
 
@@ -567,6 +567,7 @@ int32_t kv_detect_system_prompt_boundary(
     int32_t n_tokens,
     const char* chat_template_hint)
 {
+    (void)chat_template_hint; // reserved for future template-aware detection
     if (!vocab || !tokens || n_tokens <= 0) return 0;
 
     // Two-phase boundary detection. We compute a candidate boundary from
