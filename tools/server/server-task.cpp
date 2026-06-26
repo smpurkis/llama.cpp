@@ -63,8 +63,6 @@ json task_params::to_json(bool only_metrics) const {
             {"mirostat",                  sampling.mirostat},
             {"mirostat_tau",              sampling.mirostat_tau},
             {"mirostat_eta",              sampling.mirostat_eta},
-            {"adaptive_target",           sampling.adaptive_target},
-            {"adaptive_decay",            sampling.adaptive_decay},
             {"max_tokens",                n_predict},
             {"n_predict",                 n_predict}, // TODO: deduplicate?
             {"n_keep",                    n_keep},
@@ -116,8 +114,6 @@ json task_params::to_json(bool only_metrics) const {
         {"mirostat",                  sampling.mirostat},
         {"mirostat_tau",              sampling.mirostat_tau},
         {"mirostat_eta",              sampling.mirostat_eta},
-        {"adaptive_target",           sampling.adaptive_target},
-        {"adaptive_decay",            sampling.adaptive_decay},
         {"stop",                      antiprompt},
         {"max_tokens",                n_predict},
         {"n_predict",                 n_predict}, // TODO: deduplicate?
@@ -734,10 +730,6 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
         }}
     });
 
-    if (timings.prompt_n >= 0) {
-        server_sent_events.back().at("data").push_back({"timings", timings.to_json()});
-    }
-
     return server_sent_events;
 }
 
@@ -1024,7 +1016,6 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     thinking_block_started = state.thinking_block_started;
     text_block_started     = state.text_block_started;
 
-    oai_resp_created       = state.oai_resp_created;
     oai_resp_id            = state.oai_resp_id;
     oai_resp_reasoning_id  = state.oai_resp_reasoning_id;
     oai_resp_message_id    = state.oai_resp_message_id;
@@ -1032,10 +1023,6 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
 
     // track if the accumulated message has any reasoning content
     anthropic_has_reasoning = !state.chat_msg.reasoning_content.empty();
-
-    if (res_type == TASK_RESPONSE_TYPE_OAI_RESP && !state.oai_resp_created && (is_progress || n_decoded == 1)) {
-        state.oai_resp_created = true;
-    }
 
     // Pre-compute state updates based on diffs (for next chunk)
     for (const common_chat_msg_diff & diff : oaicompat_msg_diffs) {
@@ -1194,7 +1181,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
 json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
     std::vector<json> events;
 
-    if (!oai_resp_created) {
+    if (n_decoded == 1) {
         events.push_back(json {
             {"event", "response.created"},
             {"data", json {
@@ -1206,18 +1193,6 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                 }},
             }},
         });
-        events.push_back(json {
-            {"event", "response.in_progress"},
-            {"data", json {
-                {"type", "response.in_progress"},
-                {"response", json {
-                    {"id",     oai_resp_id},
-                    {"object", "response"},
-                    {"status", "in_progress"},
-                }},
-            }},
-        });
-    } else if (is_progress) {
         events.push_back(json {
             {"event", "response.in_progress"},
             {"data", json {
@@ -1327,17 +1302,6 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
             });
         }
     }
-
-    if (!events.empty()) {
-        json & data = events.back().at("data");
-        if (timings.prompt_n >= 0) {
-            data.push_back({"timings", timings.to_json()});
-        }
-        if (is_progress) {
-            data.push_back({"prompt_progress", progress.to_json()});
-        }
-    }
-
     return events;
 }
 
@@ -1650,58 +1614,33 @@ size_t server_prompt_cache::n_tokens() const {
     size_t res = 0;
 
     for (const auto & state : states) {
-        res += state.prompt.n_tokens();
+        res += state.n_tokens();
     }
 
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+        const int cur_lcp_len = it->tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
-            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+            SRV_INF("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
     }
 
-    // calculate checkpoints size to see if it will fit with the prompt
-    size_t checkpoints_size = 0;
-    for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt.size();
-    }
-
-    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
-
-    // skip over-limit entries to avoid disturbing the cache
-    if (limit_size > 0 && state_size_new > limit_size) {
-        SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
-                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
-        return nullptr;
-    }
-
-    // remove any cached prompts that are fully contained in the current prompt
+    // next, remove any cached prompts that are fully contained in the current prompt
     for (auto it = states.begin(); it != states.end();) {
-        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+        const int len = it->tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
-            SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
+        if (len == (int) it->tokens.size()) {
+            SRV_WRN(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
         } else {
             ++it;
-        }
-    }
-
-    if (limit_size > 0) {
-        // make room before allocating the new vectors to avoid breaching the limit
-        while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
         }
     }
 
@@ -1725,15 +1664,14 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     }
 
     states.push_back({
-        /*.prompt =*/ {
-            /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
-        },
-        /*.data   =*/ {
+        /*.tokens      =*/ prompt.tokens.clone(),
+        /*.data        =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
+        /*.checkpoints =*/ prompt.checkpoints,
     });
+    states.back().t_last_used = ggml_time_us();
 
     return &states.back();
 }
@@ -1742,36 +1680,34 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_best) / tokens_new.size();
+    float sim_best    = float(lcp_best) / tokens_new.size();
 
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    SRV_INF(" - looking for better prompt, base f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
     auto it_best = states.end();
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
+        const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
 
-        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
-
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
+        const float f_keep_cur = float(lcp_cur) / it->tokens.size();
+        const float sim_cur    = float(lcp_cur) / tokens_new.size();
 
         // don't trash large prompts
         if (f_keep_cur < 0.25f) {
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+        if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
             f_keep_best = f_keep_cur;
-            f_sim_best  = f_sim_cur;
+            sim_best    = sim_cur;
 
             it_best = it;
         }
     }
 
     if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+        SRV_INF(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
         {
             auto & data = it_best->data.main;
@@ -1807,7 +1743,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
         }
 
-        prompt = std::move(it_best->prompt);
+        prompt = std::move(*it_best);
 
         states.erase(it_best);
     }
@@ -1815,12 +1751,19 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
-void server_prompt_cache::update() {
+void server_prompt_cache::update(const server_tokens * tokens_ref) {
     if (limit_size > 0) {
-        while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+        // evict least valuable entries until we're under the size limit
+        while (states.size() > 1 && size() > limit_size) {
+            if (states.empty()) {
+                break;
+            }
 
-            states.pop_front();
+            auto it_worst = find_eviction_candidate(tokens_ref);
+            SRV_WRN(" - cache size limit reached, evicting entry (size = %.3f MiB, tokens = %d)\n",
+                    it_worst->size() / (1024.0 * 1024.0), it_worst->n_tokens());
+
+            states.erase(it_worst);
         }
     }
 
@@ -1831,19 +1774,75 @@ void server_prompt_cache::update() {
     const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
 
     if (limit_tokens > 0) {
-        while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+        while (states.size() > 1 && n_tokens() > limit_tokens_cur) {
+            if (states.empty()) {
+                break;
+            }
 
-            states.pop_front();
+            auto it_worst = find_eviction_candidate(tokens_ref);
+            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, evicting entry (size = %.3f MiB, tokens = %d)\n",
+                    limit_tokens, limit_tokens_cur, it_worst->size() / (1024.0 * 1024.0), it_worst->n_tokens());
+
+            states.erase(it_worst);
         }
     }
 
-    SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
+    SRV_INF(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
             states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
-        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
-                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+        SRV_INF("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
+                (const void *)&state, state.n_tokens(), state.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
+}
+
+bool server_prompt_cache::evict(const server_tokens * tokens_ref) {
+    if (states.empty()) {
+        return false;
+    }
+
+    auto it_worst = find_eviction_candidate(tokens_ref);
+    SRV_WRN(" - evicting cache entry: %d tokens, checkpoints: %d, size: %.3f MiB\n",
+            (int)it_worst->n_tokens(), (int)it_worst->checkpoints.size(), it_worst->size() / (1024.0 * 1024.0));
+    states.erase(it_worst);
+
+    return true;
+}
+
+std::list<server_prompt>::iterator server_prompt_cache::find_eviction_candidate(const server_tokens * tokens_ref) {
+    GGML_ASSERT(!states.empty());
+
+    const int64_t now = ggml_time_us();
+
+    auto it_worst = states.begin();
+    float score_worst = -1e30f;
+
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        const auto & entry = *it;
+
+        // compute eviction score: higher = more evictable
+        float score = 0.0f;
+
+        // age factor: older entries are more evictable (microseconds -> seconds)
+        const float age_s = (now - entry.t_last_used) / 1e6f;
+        score += age_s * 0.1f;  // 1 point per 10 seconds of age
+
+        // size factor: larger entries are more evictable (MiB)
+        const float size_mib = entry.size() / (1024.0f * 1024.0f);
+        score += size_mib * 2.0f;  // 2 points per MiB
+
+        // overlap penalty: entries with high overlap to current task are less evictable
+        if (tokens_ref && !tokens_ref->empty() && !entry.tokens.empty()) {
+            const int lcp = entry.tokens.get_common_prefix(*tokens_ref);
+            const float overlap = float(lcp) / tokens_ref->size();
+            score -= overlap * 50.0f;  // strong penalty for high overlap
+        }
+
+        if (score > score_worst) {
+            score_worst = score;
+            it_worst = it;
+        }
+    }
+
+    return it_worst;
 }
