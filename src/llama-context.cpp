@@ -475,7 +475,7 @@ llama_context::llama_context(
 
     // Initialize MoE expert tracking (disabled by default)
     {
-        const int64_t n_layer = hparams.n_layer;
+        const int64_t n_layer = hparams.n_layer();
         const int64_t n_expert = hparams.n_expert;
         expert_stats.resize(n_layer);
         for (int64_t il = 0; il < n_layer; ++il) {
@@ -708,7 +708,7 @@ void llama_context::sched_reserve() {
 void llama_context::track_expert_activations(ggml_cgraph * gf, uint32_t /* n_tokens */) {
     if (!gf || !expert_tracking_enabled) return;
 
-    const int64_t n_layer = model.hparams.n_layer;
+    const int64_t n_layer = model.hparams.n_layer();
     const int64_t n_expert = model.hparams.n_expert;
     const int64_t n_expert_used = model.hparams.n_expert_used;
     if (n_expert <= 0) return;  // Not an MoE model
@@ -4228,7 +4228,7 @@ int32_t llama_expert_stats_get(const struct llama_context * ctx, int32_t layer, 
     if (!ctx || !stats) return -1;
 
     const llama_model & model = ctx->get_model();
-    if (layer < 0 || (uint32_t)layer >= model.hparams.n_layer) return -1;
+    if (layer < 0 || (uint32_t)layer >= model.hparams.n_layer()) return -1;
 
     const auto * layer_stats = ctx->get_expert_stats(layer);
     if (!layer_stats) return -1;
