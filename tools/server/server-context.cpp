@@ -1200,6 +1200,11 @@ private:
             return false;
         }
 
+        if (ctx_tgt == nullptr) {
+            SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
+            return false;
+        }
+
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
@@ -1393,13 +1398,7 @@ private:
             slot.n_ctx   = n_ctx_slot;
 
             slot.mctx                   = mctx;
-            // has_mtmd is set automatically when IMAGE/AUDIO chunks are pushed
-            // to slot.prompt.tokens via push_back() (and to task.tokens via
-            // process_mtmd_prompt's chunked constructor). Do NOT pre-flag
-            // based on the model being multimodal: a multimodal model
-            // routinely serves pure-text slots, and conflating capability with
-            // content makes get_tokens()/context-shift/cache-reuse assert on
-            // otherwise valid text-only requests. See issue #11.
+            slot.prompt.tokens.has_mtmd = mctx != nullptr;
 
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
@@ -1937,7 +1936,7 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
-        SLT_DBG(slot, "[PROBE] launch_slot_with_task: slot.prompt=%zu is_processing=%d seq_pos_min=%lld seq_pos_max=%lld\n",
+        SLT_INF(slot, "[PROBE] launch_slot_with_task: slot.prompt=%zu is_processing=%d seq_pos_min=%lld seq_pos_max=%lld\n",
                 slot.prompt.tokens.size(), (int)slot.is_processing(),
                 (long long)llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
                 (long long)llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
@@ -2732,13 +2731,17 @@ private:
         if (params_base.n_ctx_checkpoints <= 0) return;
         if (!slot.task || slot.task->type != SERVER_TASK_TYPE_COMPLETION) return;
 
-        // Use prompt positions, not generation positions.
-        // The generation positions (done_pos_min/done_pos_max) extend past
-        // the prompt end and cause stale positions to persist after restore,
-        // triggering "Invalid input batch" on the next turn (issue #8).
-        const int64_t prompt_n_tokens = slot.prompt.n_tokens();
-        if (prompt_n_tokens < 64) return;
+        auto done_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+        auto done_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        int64_t done_n_tokens = done_pos_max + 1;
 
+        // Cap to prevent overflow guard on warm restart.
+        // The guard subtracts 8 when n_past >= task.n_tokens; stay well below.
+        if (done_n_tokens >= (int64_t)slot.task->n_tokens()) {
+            done_n_tokens = (int64_t)slot.task->n_tokens() - 4;
+        }
+
+        if (done_pos_min < 0 || done_n_tokens < 64) return;
         // Deferred checkpoint always captures final state. Skip the proximity
         // guard used for mid-prompt checkpoints — the deferred ckpt is never
         // "too close" to a prior ckpt; it's the most complete snapshot.
@@ -2755,8 +2758,7 @@ private:
         }
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
-        // Save prompt boundaries: pos_min=0 (start of prompt), pos_max=prompt_n_tokens-1 (end of prompt)
-        cur.update_pos(prompt_n_tokens, 0, (llama_pos)prompt_n_tokens - 1);
+        cur.update_pos(done_n_tokens, done_pos_min, done_pos_max);
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
@@ -3437,11 +3439,7 @@ private:
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
                 {
-                    // Gate on actual slot content (has_media) rather than the
-                    // model capability flag (has_mtmd): context shift is only
-                    // safe when there are no image/audio tokens in the slot's
-                    // prompt. See issue #11.
-                    GGML_ASSERT(!slot.prompt.tokens.has_media());
+                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
 
                     llama_tokens new_tokens = slot.prompt.tokens.get_tokens(); // copy
                     for (size_t i = n_keep + n_discard; i < new_tokens.size(); i++) {
@@ -3646,7 +3644,7 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
-                        SLT_DBG(slot, "[PROBE] prefill-init n_past=0 slot.prompt=%zu ssd_page_manager=%d cache_prompt=%d\n",
+                        SLT_INF(slot, "[PROBE] prefill-init n_past=0 slot.prompt=%zu ssd_page_manager=%d cache_prompt=%d\n",
                                 slot.prompt.tokens.size(), (int)(ssd_page_manager != nullptr), (int)slot.task->params.cache_prompt);
 
                         // cold start: try per-conversation SSD checkpoint restore
@@ -3861,7 +3859,7 @@ private:
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
-                                SLT_DBG(slot, "[PROBE] LCP n_past=%d slot.prompt=%zu task=%d\n",
+                                SLT_INF(slot, "[PROBE] LCP n_past=%d slot.prompt=%zu task=%d\n",
                                         n_past, slot.prompt.tokens.size(), slot.task->n_tokens());
 
                                 // if there is an alora invoked, don't cache after the invocation start
@@ -3874,12 +3872,7 @@ private:
 
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    // KV-cache reuse via shifting is only safe
-                                    // for slots with no image/audio tokens.
-                                    // has_media() reflects actual slot content;
-                                    // has_mtmd() can also be true on a pure-text
-                                    // slot on a multimodal model (issue #11).
-                                    !slot.prompt.tokens.has_media();
+                                    !slot.prompt.tokens.has_mtmd;
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
@@ -3887,8 +3880,7 @@ private:
 
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
                                 if (can_cache_reuse && n_cache_reuse > 0) {
-                                    // See comment above (issue #11).
-                                    GGML_ASSERT(!slot.prompt.tokens.has_media());
+                                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
 
                                     size_t head_c = n_past; // cache
                                     size_t head_p = n_past; // current prompt
@@ -3943,7 +3935,7 @@ private:
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
-                                SLT_DBG(slot, "[PROBE] cache_prompt=FALSE -> n_past=0 (probe=%d)\n", 1);
+                                SLT_INF(slot, "[PROBE] cache_prompt=FALSE -> n_past=0 (probe=%d)\n", 1);
                             }
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
@@ -3953,13 +3945,13 @@ private:
 
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
-                            SLT_DBG(slot, "[PROBE] pre-reset n_past=%d pos_next=%d n_swa=%d has_new=%d pos_min_thold=%d n_ckpts=%zu ssd_cold=%d\n",
+                            SLT_INF(slot, "[PROBE] pre-reset n_past=%d pos_next=%d n_swa=%d has_new=%d pos_min_thold=%d n_ckpts=%zu ssd_cold=%d\n",
                                     n_past, (int)pos_next, n_swa, (int)has_new_tokens, pos_min_thold,
                                     slot.prompt.checkpoints.size(), (int)slot.ssd_cold_start_used);
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
-                                SLT_DBG(slot, "[PROBE] in-block n_past=%d pos_min=%d pos_min_thold=%d\n",
+                                SLT_INF(slot, "[PROBE] in-block n_past=%d pos_min=%d pos_min_thold=%d\n",
                                         n_past, pos_min, pos_min_thold);
                                 if (pos_min == -1) {
                                     SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
@@ -4017,16 +4009,8 @@ private:
                                         [&](const auto & cur) {
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
-                                            // Workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]:
-                                            // for SWA models, pos_min/pos_max can be incorrect
-                                            // so the saved state may not actually contain positions
-                                            // past pos_next. Exclude those checkpoints. For non-SWA
-                                            // (KV cache + bounded rec window like Qwen3.6 hybrid),
-                                            // pos_max is correct and the checkpoint fully covers
-                                            // [pos_min, pos_max] — the deferred-final pattern
-                                            // (pos_min=0, pos_max=prompt_end) is a valid snapshot
-                                            // at any LCP position <= pos_max.
-                                            if (n_swa > 0 && cur.pos_max > pos_next) {
+                                            // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
+                                            if (cur.pos_max > pos_next) {
                                                 return false;
                                             }
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
@@ -4044,7 +4028,7 @@ private:
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_DBG(slot, "[PROBE] ckpt-restored n_past=%d ckpt=[%d,%d]\n",
+                                        SLT_INF(slot, "[PROBE] ckpt-restored n_past=%d ckpt=[%d,%d]\n",
                                                 n_past, it->pos_min, it->pos_max);
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
 
@@ -4055,7 +4039,7 @@ private:
                                     }
 
                                     if (do_reset) {
-                                        SLT_DBG(slot, "[PROBE] do_reset=true -> n_past=0 (no usable ckpt, probe=%d)\n", 1);
+                                        SLT_INF(slot, "[PROBE] do_reset=true -> n_past=0 (no usable ckpt, probe=%d)\n", 1);
                                         SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
@@ -4112,7 +4096,7 @@ private:
                                         // boundary.
                                         recovered_n_sys = n_sys;
                                         recovered = true;
-                                        SLT_DBG(slot, "[PROBE] sys-cache-fallback prefix-match recovered at n_sys=%d (exact match failed)\n",
+                                        SLT_INF(slot, "[PROBE] sys-cache-fallback prefix-match recovered at n_sys=%d (exact match failed)\n",
                                                 n_sys);
                                     }
                                 }
@@ -4134,7 +4118,7 @@ private:
                                         // the system section and will be filled as prefill
                                         // processes the remaining tokens).
                                         slot.ssd_cold_start_used = true;
-                                        SLT_DBG(slot, "[PROBE] sys-cache-fallback n_past=%d (n_sys=%d) after do_reset\n",
+                                        SLT_INF(slot, "[PROBE] sys-cache-fallback n_past=%d (n_sys=%d) after do_reset\n",
                                                 n_past, recovered_n_sys);
                                     }
                                 }
@@ -4160,7 +4144,7 @@ private:
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
-                        SLT_DBG(slot, "[PROBE] FINAL n_past=%d task.n=%d slot.prompt=%zu\n",
+                        SLT_INF(slot, "[PROBE] FINAL n_past=%d task.n=%d slot.prompt=%zu\n",
                                 n_past, slot.task->n_tokens(), slot.prompt.tokens.size());
 
                         slot.n_prompt_tokens_cache = n_past;

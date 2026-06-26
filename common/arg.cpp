@@ -5,7 +5,6 @@
 #include "common.h"
 #include "download.h"
 #include "json-schema-to-grammar.h"
-#include "llama.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -539,13 +538,6 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         }
     };
 
-    // an explicit draft file selection (e.g. -md with -hfd) disables the sidecar resolution of the draft repo
-    if (!params.speculative.draft.mparams.hf_file.empty()) {
-        plan_spec.mtp    = {};
-        plan_spec.dflash = {};
-        plan_spec.eagle3 = {};
-    }
-
     // infer the speculative type from the sidecar shipped by the draft repo when none is requested
     if (spec_types_is_default(params)) {
         if (!plan_spec.mtp.local_path.empty()) {
@@ -593,11 +585,6 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
                 hf_cache::finalize_file(plan_spec.eagle3);
             }
         });
-    }
-
-    // a wired draft sidecar counts as an explicit draft for the main plan fallback below
-    if (spec_sidecar_found) {
-        had_spec_url = true;
     }
 
     // handle plan_spec (e.g. --spec-draft-hf)
@@ -798,17 +785,6 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                     arg.c_str(), e.what(), opt.to_string().c_str()));
             }
         }
-
-        // TODO: remove this check after deprecating --mmap|mlock|dio
-        auto has_arg = [&](std::initializer_list<const char *> names) {
-            return std::any_of(names.begin(), names.end(), [&](const char * name) {
-                return seen_args.count(name);
-            });
-        };
-        if (has_arg({"-lm", "--load-mode"}) &&
-            has_arg({"--mlock", "--mmap", "--no-mmap", "-dio", "--direct-io", "-ndio", "--no-direct-io"})) {
-            LOG_WRN("DEPRECATED: `--load-mode` and `--mlock`/`--mmap`/`--direct-io` should not be combined; only the last flag on the command line will take effect\n");
-        }
     };
 
     // parse all CLI args now, so that -hf is available below for remote preset resolution
@@ -862,9 +838,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.kv_overrides.back().key[0] = 0;
     }
 
-    const bool mcp_enabled = !params.mcp_servers_config.empty() || !params.mcp_servers_json.empty();
-    if ((!params.server_tools.empty() || mcp_enabled) && !params.cors_origins_explicit) {
-        LOG_WRN("server tools or MCP servers are enabled, using localhost as default CORS origin (change via --cors-origins)\n");
+    if (!params.server_tools.empty() && !params.cors_origins_explicit) {
+        LOG_WRN("server tools are enabled, using localhost as default CORS origin (change via --cors-origins)\n");
         params.cors_origins = "localhost";
     }
 
@@ -1059,31 +1034,6 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
         devices.push_back(nullptr);
     }
     return devices;
-}
-
-void common_print_available_devices() {
-    constexpr size_t MiB = 1024 * 1024;
-    std::vector<ggml_backend_dev_t> devices;
-
-    ggml_backend_load_all();
-
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        auto * dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-            devices.push_back(dev);
-        }
-    }
-    printf("Available devices:\n");
-
-    if (devices.empty()) {
-        printf("  (none)\n");
-        return;
-    }
-    for (auto * dev : devices) {
-        size_t free, total;
-        ggml_backend_dev_memory(dev, &free, &total);
-        printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / MiB, free / MiB);
-    }
 }
 
 static void add_rpc_devices(const std::string & servers) {
@@ -1625,15 +1575,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
-        {"--checkpoint-near-end"},
-        {"--no-checkpoint-near-end"},
-        string_format("force a checkpoint within the last ubatch of every prompt, regardless of --checkpoint-min-step (default: %s)",
-            params.checkpoint_near_end ? "on" : "off"),
-        [](common_params & params, bool value) {
-            params.checkpoint_near_end = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
         {"-cpent", "--checkpoint-every-n-tokens"}, "N",
         string_format("create a checkpoint every n tokens during prefill (processing), -1 to disable (default: %d)", params.checkpoint_every_nt),
         [](common_params & params, int value) {
@@ -1684,20 +1625,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
    ).set_env("LLAMA_ARG_CACHE_SSD_MAX_COLD").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
-        {"-ssd-hot-ram", "--cache-ssd-hot-ram"}, "N",
-        string_format("hot tier RAM budget in MiB for SSD cache (default: auto-size, 0=auto)"),
-        [](common_params & params, int value) {
-            params.cache_ssd_hot_ram_mib = value;
-        }
-    ).set_env("LLAMA_ARG_CACHE_SSD_HOT_RAM").set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
-        {"-ssd-warm-ram", "--cache-ssd-warm-ram"}, "N",
-        string_format("warm tier RAM budget in MiB for SSD cache (default: auto-size, 0=auto)"),
-        [](common_params & params, int value) {
-            params.cache_ssd_warm_ram_mib = value;
-        }
-    ).set_env("LLAMA_ARG_CACHE_SSD_WARM_RAM").set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
         {"--cache-ssd-max-conversations"}, "N",
         string_format("max conversation directories (default: %d, 0=unlimited)", params.cache_ssd_max_conversations),
         [](common_params & params, int value) {
@@ -1705,37 +1632,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_SSD_MAX_CONVERSATIONS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
-        {"--cache-ssd-cold-maxsize"}, "N",
-        string_format("global cap on total cold tier size across all conversations in MiB (default: %lld, 0=unlimited)",
-            (long long)params.cache_ssd_cold_max_size_mib),
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value for --cache-ssd-cold-maxsize: must be >= 0");
-            }
-            params.cache_ssd_cold_max_size_mib = value;
-        }
-    ).set_env("LLAMA_ARG_CACHE_SSD_COLD_MAXSIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
         {"--prompt-max"}, "N",
         string_format("max system prompt cache entries (default: %d, 0=disabled)", params.prompt_cache_max),
         [](common_params & params, int value) {
             params.prompt_cache_max = value;
         }
     ).set_env("LLAMA_ARG_PROMPT_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
-        {"--cache-ssd-system-prompts"}, "N",
-        string_format("max global system prompt entries cached for reuse across conversations (default: %d, 0=disabled)", params.cache_ssd_system_prompts),
-        [](common_params & params, int value) {
-            params.cache_ssd_system_prompts = value;
-        }
-    ).set_env("LLAMA_ARG_CACHE_SSD_SYSTEM_PROMPTS").set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
-        {"--cache-ssd-system-max-days"}, "N",
-        string_format("expire system prompt cache entries unused for N days (default: %d, 0=never)", params.cache_ssd_system_max_days),
-        [](common_params & params, int value) {
-            params.cache_ssd_system_max_days = value;
-        }
-    ).set_env("LLAMA_ARG_CACHE_SSD_SYSTEM_MAX_DAYS").set_examples({LLAMA_EXAMPLE_SERVER}));
    add_opt(common_arg(
         {"-ssd-ps", "--cache-ssd-page-size"}, "N",
         string_format("tokens per page for SSD cache: 512, 1024, 2048 (default: %zu)", params.cache_ssd_page_size_tokens),
@@ -1746,13 +1648,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_ssd_page_size_tokens = value;
         }
     ).set_env("LLAMA_ARG_CACHE_SSD_PAGE_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
-        {"--cache-ssd-no-fsync"},
-        string_format("skip fsync on SSD checkpoint writes (default: %s)", params.cache_ssd_no_fsync ? "enabled" : "disabled"),
-        [](common_params & params) {
-            params.cache_ssd_no_fsync = true;
-        }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
@@ -2579,17 +2474,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         ).set_env("LLAMA_ARG_N_PARALLEL"));
     }
     add_opt(common_arg(
-        {"--max-concurrent-per-user"}, "N",
-        string_format("per-user_id concurrency cap on in-flight slots (default: %d, 0 = unlimited). also applies to the _anonymous bucket.",
-                      params.max_concurrent_per_user),
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("error: max-concurrent-per-user must be >= 0\n");
-            }
-            params.max_concurrent_per_user = value;
-        }
-    ).set_env("LLAMA_ARG_MAX_CONCURRENT_PER_USER").set_examples({LLAMA_EXAMPLE_SERVER}));
-    add_opt(common_arg(
         {"-ns", "--sequences"}, "N",
         string_format("number of sequences to decode (default: %d)", params.n_sequences),
         [](common_params & params, int value) {
@@ -2677,78 +2561,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     }
     add_opt(common_arg(
         {"--mlock"},
-        "DEPRECATED in favor of `--load-mode`: force system to keep model in RAM rather than swapping or compressing",
+        "force system to keep model in RAM rather than swapping or compressing",
         [](common_params & params) {
-            LOG_WRN("DEPRECATED: --mlock is deprecated. use --load-mode mlock instead\n");
-            params.load_mode = LLAMA_LOAD_MODE_MLOCK;
+            params.use_mlock = true;
         }
     ).set_env("LLAMA_ARG_MLOCK"));
     add_opt(common_arg(
         {"--mmap"},
         {"--no-mmap"},
-        "DEPRECATED in favor of `--load-mode`: whether to memory-map model. (if mmap disabled, slower load but may reduce pageouts if not using mlock)",
+        string_format("whether to memory-map model. (if mmap disabled, slower load but may reduce pageouts if not using mlock) (default: %s)", params.use_mmap ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
-            LOG_WRN("DEPRECATED: --mmap and --no-mmap are deprecated. use --load-mode mmap instead\n");
-            params.load_mode = value ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
+            params.use_mmap = value;
         }
     ).set_env("LLAMA_ARG_MMAP"));
     add_opt(common_arg(
         {"-dio", "--direct-io"},
         {"-ndio", "--no-direct-io"},
-        "DEPRECATED in favor of `--load-mode`: use DirectIO if available",
+        string_format("use DirectIO if available. (default: %s)", params.use_direct_io ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
-            LOG_WRN("DEPRECATED: --direct-io and --no-direct-io are deprecated. use --load-mode dio instead\n");
-            params.load_mode = value ? LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_NONE;
+            params.use_direct_io = value;
         }
     ).set_env("LLAMA_ARG_DIO"));
-    add_opt(common_arg(
-        {"-lm", "--load-mode"}, "MODE",
-        "model loading mode (default: mmap)\n"
-        "- none: no special loading mode\n"
-        "- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)\n"
-        "- mlock: mmap + force system to keep model in RAM rather than swapping or compressing\n"
-        "- dio: use DirectIO if available\n",
-        [](common_params & params, const std::string & value) {
-            /**/ if (value == "none")  { params.load_mode = LLAMA_LOAD_MODE_NONE;      }
-            else if (value == "mmap")  { params.load_mode = LLAMA_LOAD_MODE_MMAP;      }
-            else if (value == "mlock") { params.load_mode = LLAMA_LOAD_MODE_MLOCK;     }
-            else if (value == "dio")   { params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO; }
-            else { throw std::invalid_argument("invalid value"); }
-        }
-    ).set_env("LLAMA_ARG_LOAD_MODE"));
-    add_opt(common_arg(
-        {"-moe-res", "--moe-expert-residency"},
-        {"-nmoe-res", "--no-moe-expert-residency"},
-        string_format("enable MoE expert residency tracking (reduces physical memory pressure of MoE models via madvise). "
-                      "Requires --load-mode mmap. (default: %s)", params.moe_expert_residency ? "enabled" : "disabled"),
-        [](common_params & params, bool value) {
-            params.moe_expert_residency = value;
-            if (value && params.load_mode != LLAMA_LOAD_MODE_MMAP) {
-                fprintf(stderr, "warning: --moe-expert-residency requires --load-mode mmap; ignoring\n");
-                params.moe_expert_residency = false;
-            }
-        }
-    ).set_env("LLAMA_ARG_MOE_EXPERT_RESIDENCY"));
-    add_opt(common_arg(
-        {"-moe-res-k", "--moe-resident-per-layer"}, "N",
-        string_format("max experts kept hot per MoE layer (default: %d)", params.moe_resident_per_layer),
-        [](common_params & params, int value) {
-            if (value <= 0) {
-                throw std::invalid_argument("must be positive");
-            }
-            params.moe_resident_per_layer = value;
-        }
-    ).set_env("LLAMA_ARG_MOE_RESIDENT_PER_LAYER"));
-    add_opt(common_arg(
-        {"-moe-pwk", "--moe-prewarm-top-k"}, "N",
-        string_format("experts to prewarm per layer at startup (default: %d)", params.moe_residency_top_k),
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("must be >= 0");
-            }
-            params.moe_residency_top_k = value;
-        }
-    ).set_env("LLAMA_ARG_MOE_PREWARM_TOP_K"));
     add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
@@ -2776,7 +2609,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--list-devices"},
         "print list of available devices and exit",
         [](common_params &) {
-            common_print_available_devices();
+            ggml_backend_load_all();
+            std::vector<ggml_backend_dev_t> devices;
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                auto * dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    devices.push_back(dev);
+                }
+            }
+            printf("Available devices:\n");
+            for (auto * dev : devices) {
+                size_t free, total;
+                ggml_backend_dev_memory(dev, &free, &total);
+                printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / 1024 / 1024, free / 1024 / 1024);
+            }
             exit(0);
         }
     ));
@@ -3451,22 +3297,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.server_tools = parse_csv_row(value);
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TOOLS"));
-    add_opt(common_arg(
-        {"--mcp-servers-config"}, "PATH",
-        "experimental: path to JSON file with MCP server definitions (Cursor-compatible format) - do not enable in untrusted environments (default: none)\n"
-        "note: for security reasons, this will limit --cors-origins to localhost by default",
-        [](common_params & params, const std::string & value) {
-            params.mcp_servers_config = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MCP_SERVERS_CONFIG"));
-    add_opt(common_arg(
-        {"--mcp-servers-json"}, "JSON",
-        "experimental: inline JSON with MCP server definitions (Cursor-compatible format) - do not enable in untrusted environments (default: none)\n"
-        "note: for security reasons, this will limit --cors-origins to localhost by default",
-        [](common_params & params, const std::string & value) {
-            params.mcp_servers_json = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MCP_SERVERS_JSON"));
     add_opt(common_arg(
         {"-ag", "--agent"},
         {"-no-ag", "--no-agent"},

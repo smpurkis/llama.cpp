@@ -1614,29 +1614,29 @@ size_t server_prompt_cache::n_tokens() const {
     size_t res = 0;
 
     for (const auto & state : states) {
-        res += state.n_tokens();
+        res += state.prompt.n_tokens();
     }
 
     return res;
 }
 
-server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int cur_lcp_len = it->tokens.get_common_prefix(prompt.tokens);
+        const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
-            SRV_INF("%s", " - prompt is already in the cache, skipping\n");
+            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
             return nullptr;
         }
     }
 
     // next, remove any cached prompts that are fully contained in the current prompt
     for (auto it = states.begin(); it != states.end();) {
-        const int len = it->tokens.get_common_prefix(prompt.tokens);
+        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->tokens.size()) {
-            SRV_WRN(" - removing obsolete cached prompt with length %d\n", len);
+        if (len == (int) it->prompt.tokens.size()) {
+            SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
         } else {
@@ -1664,12 +1664,14 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
     }
 
     states.push_back({
-        /*.tokens      =*/ prompt.tokens.clone(),
-        /*.data        =*/ {
+        /*.prompt =*/ {
+            /*.tokens      =*/ prompt.tokens.clone(),
+            /*.checkpoints =*/ prompt.checkpoints,
+        },
+        /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
-        /*.checkpoints =*/ prompt.checkpoints,
     });
     states.back().t_last_used = ggml_time_us();
 
@@ -1682,15 +1684,15 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
     float sim_best    = float(lcp_best) / tokens_new.size();
 
-    SRV_INF(" - looking for better prompt, base f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
     auto it_best = states.end();
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
+        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
-        const float f_keep_cur = float(lcp_cur) / it->tokens.size();
+        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
         const float sim_cur    = float(lcp_cur) / tokens_new.size();
 
         // don't trash large prompts
@@ -1707,7 +1709,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     if (it_best != states.end()) {
-        SRV_INF(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+        SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
         {
             auto & data = it_best->data.main;
@@ -1743,7 +1745,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
         }
 
-        prompt = std::move(*it_best);
+        prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
     }
@@ -1761,7 +1763,7 @@ void server_prompt_cache::update(const server_tokens * tokens_ref) {
 
             auto it_worst = find_eviction_candidate(tokens_ref);
             SRV_WRN(" - cache size limit reached, evicting entry (size = %.3f MiB, tokens = %d)\n",
-                    it_worst->size() / (1024.0 * 1024.0), it_worst->n_tokens());
+                    it_worst->size() / (1024.0 * 1024.0), it_worst->prompt.n_tokens());
 
             states.erase(it_worst);
         }
@@ -1781,18 +1783,18 @@ void server_prompt_cache::update(const server_tokens * tokens_ref) {
 
             auto it_worst = find_eviction_candidate(tokens_ref);
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, evicting entry (size = %.3f MiB, tokens = %d)\n",
-                    limit_tokens, limit_tokens_cur, it_worst->size() / (1024.0 * 1024.0), it_worst->n_tokens());
+                    limit_tokens, limit_tokens_cur, it_worst->size() / (1024.0 * 1024.0), it_worst->prompt.n_tokens());
 
             states.erase(it_worst);
         }
     }
 
-    SRV_INF(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
+    SRV_TRC(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
             states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto & state : states) {
-        SRV_INF("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
-                (const void *)&state, state.n_tokens(), state.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+        SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
+                (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
 }
 
@@ -1803,13 +1805,13 @@ bool server_prompt_cache::evict(const server_tokens * tokens_ref) {
 
     auto it_worst = find_eviction_candidate(tokens_ref);
     SRV_WRN(" - evicting cache entry: %d tokens, checkpoints: %d, size: %.3f MiB\n",
-            (int)it_worst->n_tokens(), (int)it_worst->checkpoints.size(), it_worst->size() / (1024.0 * 1024.0));
+            (int)it_worst->prompt.n_tokens(), (int)it_worst->prompt.checkpoints.size(), it_worst->size() / (1024.0 * 1024.0));
     states.erase(it_worst);
 
     return true;
 }
 
-std::list<server_prompt>::iterator server_prompt_cache::find_eviction_candidate(const server_tokens * tokens_ref) {
+std::list<server_prompt_cache_state>::iterator server_prompt_cache::find_eviction_candidate(const server_tokens * tokens_ref) {
     GGML_ASSERT(!states.empty());
 
     const int64_t now = ggml_time_us();
@@ -1832,8 +1834,8 @@ std::list<server_prompt>::iterator server_prompt_cache::find_eviction_candidate(
         score += size_mib * 2.0f;  // 2 points per MiB
 
         // overlap penalty: entries with high overlap to current task are less evictable
-        if (tokens_ref && !tokens_ref->empty() && !entry.tokens.empty()) {
-            const int lcp = entry.tokens.get_common_prefix(*tokens_ref);
+        if (tokens_ref && !tokens_ref->empty() && !entry.prompt.tokens.empty()) {
+            const int lcp = entry.prompt.tokens.get_common_prefix(*tokens_ref);
             const float overlap = float(lcp) / tokens_ref->size();
             score -= overlap * 50.0f;  // strong penalty for high overlap
         }

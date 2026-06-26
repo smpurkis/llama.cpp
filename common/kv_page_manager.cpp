@@ -15,7 +15,9 @@
 #include <errno.h>
 
 // Platform-specific memory detection
-#include "host-ram.h"
+#ifdef __linux__
+#include <sys/sysinfo.h>
+#endif
 
 namespace llama {
 
@@ -39,6 +41,7 @@ static void queue_page_save(kv_page_manager* km, uint64_t page_id);
 static void wait_for_page_loaded(kv_page_manager* km, uint64_t page_id);
 static void io_thread_func(kv_page_manager* km);
 static uint64_t get_timestamp_ms();
+static size_t get_available_memory_bytes();
 static uint64_t calculate_eviction_score(kv_page_manager* km, const kv_page_entry& entry);
 
 // =============================================================================
@@ -391,7 +394,7 @@ void kv_page_manager_perf_stats(kv_page_manager* km,
 }
 
 void kv_page_manager_auto_size(kv_page_manager* km) {
-    size_t available = common::host_available_ram();
+    size_t available = get_available_memory_bytes();
     km->detected_memory_bytes = available;
     
     // Reserve some memory for system
@@ -798,5 +801,15 @@ static uint64_t get_timestamp_ms() {
     return static_cast<uint64_t>(ms);
 }
 
+static size_t get_available_memory_bytes() {
+#ifdef __linux__
+    struct sysinfo info;
+    if (sysinfo(&info) == 0) {
+        return info.freeram * info.mem_unit;
+    }
+#endif
+    // Default fallback: assume 8GB
+    return 8ULL * 1024 * 1024 * 1024;
+}
 
 } // namespace llama

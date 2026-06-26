@@ -62,18 +62,15 @@ public:
     // Store a checkpoint with token sequence for cross-slot matching
     // conv_hash routes to the correct per-conversation cache.
     // Creates the conversation directory automatically on first use.
-    // ctx is required to compute full state (recurrent + KV cache) for SSD storage.
-    // ctx_dft is the MTP/draft context (nullptr if none or mem-shared).
+    // ctx is required to compute full state (recurrent + KV cache) for SSD storage
     bool store_checkpoint_with_tokens(
         uint32_t slot_id,
         struct llama_context* ctx,
-        struct llama_context* ctx_dft,
         const common_prompt_checkpoint& ckpt,
         const llama_token* tokens,
         size_t tokens_size,
         uint32_t turn_id,
-        uint64_t conv_hash = 0,
-        const std::string& user_id = std::string()
+        uint64_t conv_hash = 0
     );
 
     // Load a checkpoint back to slot memory
@@ -81,22 +78,18 @@ public:
         uint32_t slot_id,
         uint32_t turn_id,
         struct llama_context* ctx,
-        struct llama_context* ctx_dft,
         int32_t& out_pos_min,
         int32_t& out_pos_max,
-        uint64_t& out_n_tokens,
-        std::vector<uint8_t>* out_spec_data = nullptr
+        uint64_t& out_n_tokens
     );
 
     // Load a checkpoint by its SSD cache ID (for cross-slot restore)
     bool load_checkpoint_by_id(
         uint64_t checkpoint_id,
         struct llama_context* ctx,
-        struct llama_context* ctx_dft,
         int32_t& out_pos_min,
         int32_t& out_pos_max,
-        uint64_t& out_n_tokens,
-        std::vector<uint8_t>* out_spec_data = nullptr
+        uint64_t& out_n_tokens
     );
 
     // Prefetch checkpoints for a slot before processing
@@ -119,36 +112,26 @@ public:
         uint64_t& out_n_tokens,
         uint64_t conv_hash = 0,
         int32_t n_past = -1,
-        uint64_t max_n_tokens = UINT64_MAX,
-        const std::string& user_id = std::string()
+        uint64_t max_n_tokens = UINT64_MAX
     );
 
     // Find matching checkpoint by token prefix and restore to VRAM (cross-session restart)
     // Routes to per-conversation cache. Falls back to continuation detection
     // across all conversation directories if conv_hash isn't known yet.
-    // dest_seq_id: current slot's seq_id — KV cells are restored under this id so that
-    // llama_memory_seq_pos_min() returns a valid value for the slot after restore.
     bool find_and_load_checkpoint(
         const llama_token* tokens,
         size_t tokens_size,
         uint32_t current_turn,
         struct llama_context* ctx,
-        struct llama_context* ctx_dft,
-        uint32_t dest_seq_id,
         int32_t& out_pos_min,
         int32_t& out_pos_max,
         uint64_t& out_n_tokens,
-        std::vector<uint8_t>* out_spec_data = nullptr,
         uint64_t conv_hash = 0,
         int32_t n_past = -1,
-        uint64_t max_n_tokens = UINT64_MAX,
-        int32_t* out_lcp = nullptr,
-        float* out_overlap = nullptr,
-        bool* out_is_continuation = nullptr,
-        const std::string& user_id = std::string()
+        uint64_t max_n_tokens = UINT64_MAX
     );
 
-   // Evict all checkpoints for a specific slot
+    // Evict all checkpoints for a specific slot
     void evict_slot(uint32_t slot_id);
 
     // Get checkpoint data for a specific slot
@@ -169,18 +152,10 @@ public:
     // Called once after llama_model is loaded.
     void set_model_info(const struct llama_model* model,
                         int cache_type_k, int cache_type_v);
-    // Configure SSD checkpoint writes: when true, skip fsync for lower write latency.
-    void set_no_fsync(bool no_fsync);
-
 
     // Max conversations: LRU eviction of entire conversation directories when exceeded.
     // Set before any store/find calls. Default: 16.
     int max_conversations = 16;
-
-    // Global cap on total cold tier bytes across all conversation directories.
-    // When exceeded, oldest conversations (by mtime) are evicted as whole directories.
-    // 0 = unlimited. Default: 0.
-    size_t cold_max_size_bytes = 0;
 
     std::unordered_map<uint32_t, stored_checkpoint> checkpoints_; // slot_id -> checkpoint
     size_t max_cross_slot_checkpoints_;
@@ -197,35 +172,12 @@ private:
     // Get or create cache for a conversation hash
     server_ssd_cache* get_or_create_cache(uint64_t conv_hash);
 
-    // Get or create a user-scoped cache. user_id is hashed and the cache
-    // is created under the "u/" namespace, isolated from anonymous
-    // conv_hash caches on disk. Continuation matching across user_id
-    // caches is disabled (privacy).
-    server_ssd_cache* get_or_create_user_cache(const std::string& user_id);
-
-    // Compute the total bytes of cold tier checkpoints across all
-    // conversation directories (anonymous + user-scoped). Scans indexes;
-    // O(total_checkpoints). Caller must hold mutex_.
-    size_t compute_cold_total_bytes_locked() const;
-
-    // Evict whole conversation directories (oldest by mtime first) until
-    // total cold bytes <= cold_max_size_bytes, or no more conversations
-    // can be evicted. Logs each evicted directory. No-op when cap is 0.
-    // Caller must hold mutex_.
-    void evict_conversations_for_size_locked();
-
     // Per-conversation caches (conv_hash -> cache instance)
     std::string ssd_base_path_;
     kv_ssd_config config_;
     uint64_t model_compat_hash_ = 0;
     std::unordered_map<uint64_t, std::unique_ptr<kv_ssd_cache>> conv_caches_;
     std::unordered_map<uint64_t, std::unique_ptr<server_ssd_cache>> conv_wrappers_;
-
-    // User-scoped caches. Parallel to conv_caches_ but isolated on disk
-    // under the "u/" namespace. Keyed by fnv1a(user_id) so the on-disk
-    // layout is the same hash format as anonymous caches.
-    std::unordered_map<uint64_t, std::unique_ptr<kv_ssd_cache>> user_caches_;
-    std::unordered_map<uint64_t, std::unique_ptr<server_ssd_cache>> user_wrappers_;
 };
 
 } // namespace llama

@@ -6,7 +6,6 @@
 
 #include "ggml-opt.h"
 #include "ggml.h"
-#include "llama.h"
 
 #include <set>
 #include <sstream>
@@ -173,7 +172,6 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark speculative decoding (DFlash + Markov head)
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
@@ -285,14 +283,18 @@ struct common_params_sampling {
 
     // reasoning budget sampler parameters
     // these are populated by the server/CLI based on chat template params
-    int32_t                   reasoning_budget_tokens   = -1;  // -1 = disabled, >= 0 = token budget
-    std::vector<llama_token>  reasoning_budget_start;          // start tag token sequence
-    std::vector<llama_tokens> reasoning_budget_end;            // end tag token sequences; the first tag is used as the forcing sequence
-    std::vector<llama_token>  reasoning_budget_forced;         // forced sequence (message + first end tag)
-    std::string               reasoning_budget_message;        // message injected before end tag when budget exhausted
-    bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
+    int32_t                  reasoning_budget_tokens   = -1;   // -1 = disabled, >= 0 = token budget
+    std::vector<llama_token> reasoning_budget_start;           // start tag token sequence
+    std::vector<llama_token> reasoning_budget_end;             // end tag token sequence
+    std::vector<llama_token> reasoning_budget_forced;          // forced sequence (message + end tag)
+    std::string              reasoning_budget_message;         // message injected before end tag when budget exhausted
+    bool                     reasoning_control = false;        // create the budget sampler on demand so reasoning can be ended at runtime
 
     bool backend_sampling = false;
+
+    bool has_logit_bias() const {
+        return !logit_bias.empty();
+    }
 
     // print the parameters into a string
     std::string print() const;
@@ -385,7 +387,7 @@ struct common_params_speculative {
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;
@@ -453,7 +455,6 @@ struct common_params {
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
-    int32_t max_concurrent_per_user = 0;    // 0 = unlimited. cap on in-flight slots per user_id (also applies to the anonymous bucket).
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t grp_attn_n            =     1; // group-attention factor
@@ -481,7 +482,6 @@ struct common_params {
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
-    enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_MMAP; // how to load the model
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -572,6 +572,9 @@ struct common_params {
     bool kv_unified        = false; // enable unified KV cache
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
+    bool use_mmap          = true;  // enable mmap to use filesystem cache
+    bool use_direct_io     = false; // read from disk without buffering
+    bool use_mlock         = false; // use mlock to keep model in memory
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading
@@ -580,16 +583,6 @@ struct common_params {
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
-
-    // MoE expert SSD residency (Phase 1, madvise-based).
-    // When enabled, tracks which MoE experts fire per layer and uses madvise
-    // to keep hot experts paged in while cold ones are evicted from RAM.
-    // Reduces physical memory footprint of MoE models; relies on Linux mmap.
-    bool   moe_expert_residency    = false;  // master enable
-    int32_t moe_resident_per_layer = 32;     // experts kept hot per layer
-    bool   moe_residency_prewarm   = true;   // prewarm top-K experts at startup
-    int32_t moe_residency_top_k    = 16;     // prewarm K experts
-    bool   moe_residency_log       = true;   // log hit rate every 16 decodes
 
     bool single_turn       = false; // single turn chat conversation
 
@@ -630,9 +623,7 @@ struct common_params {
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
-    int32_t checkpoint_every_nt = -1;   // make a checkpoint every n tokens during prefill, -1 to disable
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
-    bool    checkpoint_near_end = false; // create a checkpoint near the end of every prompt (upstream default: false)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     std::string cache_ssd_path = "";       // path for SSD-backed KV cache (empty = disabled)
     int32_t cache_ssd_max_checkpoints = 64;  // max checkpoints to store on SSD per slot
@@ -641,13 +632,7 @@ struct common_params {
     size_t cache_ssd_page_size_tokens = 1024;     // tokens per page (512/1024/2048)
    int32_t cache_ssd_max_cold = 0;         // max cold tier checkpoints (0=unlimited)
     int32_t cache_ssd_max_conversations = 16; // max conversation directories
-    int32_t cache_ssd_hot_ram_mib = 0;       // hot tier RAM budget in MiB (0=auto-size)
-    int32_t cache_ssd_warm_ram_mib = 0;      // warm tier RAM budget in MiB (0=auto-size)
-    int64_t cache_ssd_cold_max_size_mib = 0; // global cap on total cold tier bytes in MiB (0=unlimited)
     int32_t prompt_cache_max = 8;           // max prompt buffer entries (deduplicated system prompts)
-    int32_t cache_ssd_system_prompts = 8;   // max global system prompts to cache (0=disabled)
-    int32_t cache_ssd_system_max_days = 30; // expire system prompts unused for N days (0=never)
-    bool cache_ssd_no_fsync = false;      // skip fsync on SSD checkpoint writes (trade durability for latency)
 
    std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
@@ -691,10 +676,6 @@ struct common_params {
 
     // enable built-in tools
     std::vector<std::string> server_tools;
-
-    // MCP server configs (Cursor-compatible JSON)
-    std::string mcp_servers_config;   // path to JSON file with MCP server definitions
-    std::string mcp_servers_json;     // inline JSON with MCP server definitions
 
     // router server configs
     std::string models_dir    = "";     // directory containing models for the router server
@@ -972,17 +953,10 @@ enum common_context_seq_rm_type {
 // note: clears the memory of the context
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
 
-struct common_memory {
-    llama_context * ctx_tgt = nullptr;
-    llama_context * ctx_dft = nullptr;
-
-    void init(llama_context * ctx_tgt, llama_context * ctx_dft = nullptr);
-
-    // aborts execution on failure
-    void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
-    void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
-    void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
-};
+// aborts execution on failure
+void common_context_seq_rm (llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1);
+void common_context_seq_add(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta);
+void common_context_seq_cp (llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
 
 //
 // Batch utils

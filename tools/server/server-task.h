@@ -606,25 +606,9 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
-    // timestamp of last access (used for smarter cache eviction)
-    int64_t t_last_used = 0;
-
     void clear() {
         tokens.clear();
-        data = {};
         checkpoints.clear();
-    }
-
-    size_t size() const {
-        size_t res = 0;
-
-        res += data.size();
-
-        for (const auto & ckpt : checkpoints) {
-            res += ckpt.size();
-        }
-
-        return res;
     }
 
     int n_tokens() const {
@@ -651,6 +635,9 @@ struct server_prompt_data {
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
+
+    // timestamp of last access (used for smarter cache eviction)
+    int64_t t_last_used = 0;
 
     size_t size() const {
         size_t res = data.size();
@@ -683,7 +670,7 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 
     // update cache, evicting entries that exceed memory limits
     // tokens_ref: the incoming task tokens, used to compute overlap for smarter eviction
@@ -699,7 +686,7 @@ private:
     // Scores entries by: recency (older = more evictable), size (larger = more evictable),
     // and overlap with tokens_ref (less overlap = more evictable).
     // Returns iterator to the worst entry.
-    std::list<server_prompt>::iterator find_eviction_candidate(const server_tokens * tokens_ref = nullptr);
+    std::list<server_prompt_cache_state>::iterator find_eviction_candidate(const server_tokens * tokens_ref = nullptr);
 };
 
 // used exclusively by router mode
