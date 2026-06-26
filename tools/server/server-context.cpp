@@ -1,4 +1,7 @@
 #include "server-context.h"
+#include "server-context-page-manager.h"
+#include "kv-ssd-system-cache.h"
+#include "kv-ssd-cache.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -205,6 +208,10 @@ struct server_slot {
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
+    bool deferred_final_checkpoint = false;  // create final checkpoint after first token
+    bool ssd_cold_start_used       = false;  // SSD cache restored for this slot on cold start
+    uint64_t conv_hash             = 0;      // consistent conversation hash for all checkpoints
+    std::string user_id_;                        // identity of the owning task (for scheduling/affinity)
 
     stop_type stop;
 
@@ -300,6 +307,10 @@ struct server_slot {
         generated_text = "";
         has_new_line   = false;
         truncated      = false;
+        deferred_final_checkpoint = false;
+        ssd_cold_start_used       = false;
+        conv_hash                 = 0;
+        user_id_.clear();
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
@@ -858,6 +869,17 @@ public:
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
 
+    // get the number of in-flight slots for a given user_id (used for
+    // per-user concurrency cap enforcement at the HTTP layer). Returns
+    // 0 for unknown users. Anonymous bucket uses the "_anonymous" key.
+    int get_active_user_count(const std::string & user_id) const {
+        if (params_base.max_concurrent_per_user <= 0) return 0;
+        const std::string bucket = user_id.empty() ? std::string("_anonymous") : user_id;
+        std::lock_guard<std::mutex> lock(queue_tasks.mutex_tasks);
+        auto it = user_counts_.find(bucket);
+        return (it == user_counts_.end()) ? 0 : it->second;
+    }
+
     server_queue    queue_tasks;
     server_response queue_results;
 
@@ -891,10 +913,8 @@ private:
 
     server_batch batch;
 
-    llama_model   * model_dft = nullptr;
-    llama_context * ctx_dft   = nullptr;
-
-    common_speculative_init_result_ptr spec_init;
+    llama_model_ptr model_dft;
+    llama_context_ptr ctx_dft;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -918,6 +938,21 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // SSD-backed KV cache
+    std::unique_ptr<llama::server_context_page_manager> ssd_page_manager;
+
+    // Global system prompt KV cache (cross-conversation)
+    std::unique_ptr<kv_ssd_system_cache> sys_cache;
+
+    // Per-slot system prompt hash tracking (dedupe extraction)
+    std::unordered_map<int, uint64_t> slot_sys_hash;
+
+    // Monotonic turn counter for SSD cache tiering (incremented per slot release)
+    uint32_t ssd_turn_counter = 0;
+
+    // Per-user concurrency tracking (user_id -> active slot count)
+    mutable std::unordered_map<std::string, int> user_counts_;
+
     server_metrics metrics;
 
     json json_ui_settings = json::object();
@@ -935,10 +970,8 @@ private:
 
     void destroy() {
         spec.reset();
-        spec_init.reset();
-
-        ctx_dft   = nullptr;
-        model_dft = nullptr;
+        ctx_dft.reset();
+        model_dft.reset();
 
         llama_init.reset();
 
@@ -1082,15 +1115,30 @@ private:
         // optionally reserve VRAM for the draft / MTP context before fitting the target model
         if (params_base.fit_params) {
             if (has_spec) {
-                // MTP draft context lives on the target model, only context+compute are new
-                bool measure_model_bytes = has_draft;
+                common_params params_dft = params_base;
+                bool measure_model_bytes = true;
 
-                common_params params_dft = common_base_params_to_speculative(params_base);
+                if (has_draft) {
+                    const auto & params_spec = params_base.speculative.draft;
+                    params_dft.devices               = params_spec.devices;
+                    params_dft.model                 = params_spec.mparams;
+                    params_dft.n_gpu_layers          = params_spec.n_gpu_layers;
+                    params_dft.cache_type_k          = params_spec.cache_type_k;
+                    params_dft.cache_type_v          = params_spec.cache_type_v;
+                    params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+                } else {
+                    // MTP draft context lives on the target model, only context+compute are new
+                    measure_model_bytes = false;
+                }
+
+                params_dft.n_outputs_max = params_base.n_parallel;
 
                 auto mparams_dft = common_model_params_to_llama(params_dft);
                 auto cparams_dft = common_context_params_to_llama(params_dft);
                 if (spec_mtp) {
                     cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                    cparams_dft.type_k   = params_base.speculative.draft.cache_type_k;
+                    cparams_dft.type_v   = params_base.speculative.draft.cache_type_v;
                 }
                 cparams_dft.n_rs_seq = 0;
 
@@ -1163,35 +1211,81 @@ private:
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
-        if (has_spec) {
-            // spec_mtp doesn't use load a model internally, so we report 0.0 and 1.0 manually
-            load_progress_callback(0.0f, &load_progress_spec);
-            load_progress_spec.t_last_load_progress_ms = 0;  // reset so internal cbs aren't delayed
+        if (has_draft) {
+            // TODO speculative: move to common/speculative.cpp?
+            const auto & params_spec = params_base.speculative.draft;
 
-            {
-                common_params params_dft = common_base_params_to_speculative(params_base);
+            SRV_TRC("loading draft model '%s'\n", params_spec.mparams.path.c_str());
 
-                // progress callback
-                params_dft.load_progress_callback           = load_progress_callback;
-                params_dft.load_progress_callback_user_data = &load_progress_spec;
+            auto params_dft = params_base;
 
-                spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
-                model_dft = spec_init->model();
-                ctx_dft   = spec_init->context();
+            params_dft.devices      = params_spec.devices;
+            params_dft.model        = params_spec.mparams;
+            params_dft.n_gpu_layers = params_spec.n_gpu_layers;
+            params_dft.cache_type_k = params_spec.cache_type_k;
+            params_dft.cache_type_v = params_spec.cache_type_v;
 
-                if (has_draft && model_dft == nullptr) {
-                    SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
-                    return false;
-                }
-
-                if (ctx_dft == nullptr) {
-                    SRV_ERR("%s", "failed to create MTP context\n");
-                    return false;
-                }
-
-                params_base.speculative.draft.ctx_tgt = ctx_tgt;
-                params_base.speculative.draft.ctx_dft = ctx_dft;
+            if (params_spec.cpuparams.n_threads > 0) {
+                params_dft.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
+                params_dft.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
             }
+
+            params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+
+            auto mparams_dft = common_model_params_to_llama(params_dft);
+
+            // progress callback
+            mparams_dft.progress_callback           = load_progress_callback;
+            mparams_dft.progress_callback_user_data = &load_progress_spec;
+
+            model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
+            if (model_dft == nullptr) {
+                SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
+                return false;
+            }
+
+            auto cparams = common_context_params_to_llama(params_dft);
+
+            if (spec_mtp) {
+                cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            }
+
+            // note: for small models maybe we can set this to the maximum possible draft from all speculative types
+            //       the extra memory for small models is likely negligible?
+            cparams.n_rs_seq  = 0;
+            cparams.ctx_other = ctx_tgt;
+
+            ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
+            if (ctx_dft == nullptr) {
+                SRV_ERR("%s", "failed to create draft context\n");
+                return false;
+            }
+
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+            params_base.speculative.draft.ctx_dft = ctx_dft.get();
+        } else if (spec_mtp) {
+            // no new model load, so we simply report 0.0 and 1.0 progress
+            load_progress_callback(0.0f, &load_progress_spec);
+
+            SRV_TRC("creating MTP draft context against the target model '%s'\n",
+                    params_base.model.path.c_str());
+
+            auto cparams_mtp = common_context_params_to_llama(params_base);
+            cparams_mtp.ctx_type      = LLAMA_CONTEXT_TYPE_MTP;
+            cparams_mtp.type_k        = params_base.speculative.draft.cache_type_k;
+            cparams_mtp.type_v        = params_base.speculative.draft.cache_type_v;
+            cparams_mtp.n_rs_seq      = 0;
+            cparams_mtp.n_outputs_max = params_base.n_parallel;
+            cparams_mtp.ctx_other     = ctx_tgt;
+
+            ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
+            if (ctx_dft == nullptr) {
+                SRV_ERR("%s", "failed to create MTP context\n");
+                return false;
+            }
+
+            params_base.speculative.draft.ctx_tgt = ctx_tgt;
+            params_base.speculative.draft.ctx_dft = ctx_dft.get();
 
             load_progress_callback(1.0f, &load_progress_spec);
         }
@@ -1285,15 +1379,13 @@ private:
         }
 
         if (ctx_dft) {
-            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
         }
 
         if (spec) {
             SRV_TRC("%s", "speculative decoding context initialized\n");
         } else {
-            spec_init.reset();
-            ctx_dft   = nullptr;
-            model_dft = nullptr;
+            ctx_dft.reset();
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -1301,7 +1393,7 @@ private:
 
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
-            slot.ctx_dft = ctx_dft;
+            slot.ctx_dft = ctx_dft.get();
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
 
@@ -1311,6 +1403,25 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
+                // SSD turn completion tracking + per-user concurrency release
+                for (auto & s : slots) {
+                    if (s.id == id_slot) {
+                        on_turn_complete(s);
+                        // Decrement the per-user active-slot counter so the
+                        // user can launch another request. Skip empty
+                        // user_id_ (anonymous bucket not tracked here).
+                        if (!s.user_id_.empty() && params_base.max_concurrent_per_user > 0) {
+                            std::lock_guard<std::mutex> lock(queue_tasks.mutex_tasks);
+                            auto it = user_counts_.find(s.user_id_);
+                            if (it != user_counts_.end()) {
+                                if (--it->second <= 0) {
+                                    user_counts_.erase(it);
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
@@ -1361,6 +1472,98 @@ private:
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
+        }
+
+        // SSD-backed KV cache initialization
+        if (!params_base.cache_ssd_path.empty()) {
+            llama::kv_eviction_config cfg;
+            cfg.max_hot_bytes  = params_base.cache_ssd_hot_ram_mib > 0
+                ? (size_t)params_base.cache_ssd_hot_ram_mib * 1024 * 1024 : 6ULL * 1024 * 1024;
+            cfg.max_warm_bytes = params_base.cache_ssd_warm_ram_mib > 0
+                ? (size_t)params_base.cache_ssd_warm_ram_mib * 1024 * 1024 : 2ULL * 1024 * 1024;
+            // Explicit RAM caps are hard limits: disable auto-sizing so the per-conversation
+            // cache in common/kv-ssd-cache.cpp does not override these caps with values
+            // derived from sysinfo.freeram at conversation-create time. Both flags unset
+            // (default) keeps auto-sizing on so existing setups are unaffected.
+            cfg.auto_size = (params_base.cache_ssd_hot_ram_mib == 0 &&
+                             params_base.cache_ssd_warm_ram_mib == 0);
+            cfg.hot_window_tokens = params_base.cache_ssd_hot_window_tokens;
+            cfg.warm_window_tokens = params_base.cache_ssd_warm_window_tokens;
+            cfg.page_size_tokens = params_base.cache_ssd_page_size_tokens;
+            cfg.max_cold_checkpoints = params_base.cache_ssd_max_cold;
+            cfg.turn_inactivity_threshold = 2;
+
+            ssd_page_manager = std::make_unique<llama::server_context_page_manager>(
+                params_base.cache_ssd_path.c_str(), &cfg,
+                (size_t)n_ctx, params_base.cache_ssd_max_checkpoints);
+            ssd_page_manager->max_conversations = params_base.cache_ssd_max_conversations;
+            // Global cap on cold tier bytes across all conversation directories.
+            // 0 = unlimited (legacy default). Specified in MiB for parity with
+            // --cache-ssd-hot-ram / --cache-ssd-warm-ram.
+            ssd_page_manager->cold_max_size_bytes =
+                params_base.cache_ssd_cold_max_size_mib > 0
+                    ? (size_t)params_base.cache_ssd_cold_max_size_mib * 1024 * 1024
+                    : 0;
+            ssd_page_manager->set_no_fsync(params_base.cache_ssd_no_fsync);
+
+            // Set model info after page manager exists
+            ssd_page_manager->set_model_info(model_tgt,
+                params_base.cache_type_k, params_base.cache_type_v);
+
+            // Seed turn counter from max on disk (persistent across restarts)
+            ssd_turn_counter = ssd_page_manager->get_max_turn_id() + 1;
+
+            SRV_INF("SSD cache enabled: path=%s, hot=%d MiB, warm=%d MiB\n",
+                    params_base.cache_ssd_path.c_str(),
+                    params_base.cache_ssd_hot_ram_mib,
+                    params_base.cache_ssd_warm_ram_mib);
+        }
+
+        // Initialize global system prompt cache (cross-conversation reuse)
+        if (params_base.cache_ssd_system_prompts > 0 && !params_base.cache_ssd_path.empty()) {
+            // Compute model compat_hash (same FNV-1a as set_model_info)
+            char desc_buf[2048];
+            int desc_len = llama_model_desc(model_tgt, desc_buf, sizeof(desc_buf));
+            uint64_t compat_h = (desc_len > 0) ? 14695981039346656037ULL : 0;
+            if (desc_len > 0) {
+                for (int i = 0; i < desc_len; i++) {
+                    compat_h ^= (uint64_t)(unsigned char)desc_buf[i];
+                    compat_h *= 1099511628211ULL;
+                }
+                uint32_t tk = (uint32_t)params_base.cache_type_k;
+                compat_h ^= (uint64_t)(tk & 0xFF);         compat_h *= 1099511628211ULL;
+                compat_h ^= (uint64_t)((tk >> 8) & 0xFF);  compat_h *= 1099511628211ULL;
+                compat_h ^= (uint64_t)((tk >> 16) & 0xFF); compat_h *= 1099511628211ULL;
+                compat_h ^= (uint64_t)((tk >> 24) & 0xFF); compat_h *= 1099511628211ULL;
+                uint32_t tv = (uint32_t)params_base.cache_type_v;
+                compat_h ^= (uint64_t)(tv & 0xFF);         compat_h *= 1099511628211ULL;
+                compat_h ^= (uint64_t)((tv >> 8) & 0xFF);  compat_h *= 1099511628211ULL;
+                compat_h ^= (uint64_t)((tv >> 16) & 0xFF); compat_h *= 1099511628211ULL;
+                compat_h ^= (uint64_t)((tv >> 24) & 0xFF); compat_h *= 1099511628211ULL;
+            }
+
+            static auto hex64 = [](uint64_t h) {
+                char buf[17];
+                std::snprintf(buf, sizeof(buf), "%016lx", (unsigned long)h);
+                return std::string(buf);
+            };
+
+            std::string sys_dir = params_base.cache_ssd_path
+                + "/sys-" + hex64(compat_h);
+
+            sys_cache = std::make_unique<kv_ssd_system_cache>();
+            sys_cache->max_entries = (size_t)params_base.cache_ssd_system_prompts;
+            sys_cache->max_unused_days = params_base.cache_ssd_system_max_days;
+
+            if (sys_cache->init(sys_dir, compat_h)) {
+                SRV_INF("system prompt cache enabled: max_entries=%d, max_days=%d, path=%s\n",
+                        params_base.cache_ssd_system_prompts,
+                        params_base.cache_ssd_system_max_days,
+                        sys_dir.c_str());
+            } else {
+                SRV_WRN("%s\n", "system prompt cache init failed, disabling");
+                sys_cache.reset();
+            }
         }
 
         if (!params_base.model_alias.empty()) {
@@ -1532,6 +1735,23 @@ private:
 
         bool update_cache = false;
 
+        // Per-user concurrency cap. If the requesting user_id (or the
+        // _anonymous bucket for empty user_id) is already at the cap,
+        // refuse the slot. Caller is expected to handle nullptr (defer
+        // the task). The HTTP layer has a faster path that returns 429
+        // synchronously when the user is also over cap at queue time.
+        if (params_base.max_concurrent_per_user > 0) {
+            const std::string bucket = task.user_id.empty() ? std::string("_anonymous") : task.user_id;
+            std::lock_guard<std::mutex> lock(queue_tasks.mutex_tasks);
+            auto it = user_counts_.find(bucket);
+            const int cur = (it == user_counts_.end()) ? 0 : it->second;
+            if (cur >= params_base.max_concurrent_per_user) {
+                SRV_INF("per-user concurrency cap hit for user_id='%s' (cur=%d, cap=%d)\n",
+                        bucket.c_str(), cur, params_base.max_concurrent_per_user);
+                return nullptr;
+            }
+        }
+
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
@@ -1591,9 +1811,32 @@ private:
         if (ret == nullptr) {
             int64_t t_last = -1;
 
+            // Slot affinity: prefer slots already owned by the requesting
+            // user_id (cache-locality win) before falling back to LRU.
+            // An empty slot.user_id_ is unowned and fair game.
+            const bool want_affinity = !task.user_id.empty();
+            const std::string & want_user = task.user_id;
+
+            if (want_affinity) {
+                for (server_slot & slot : slots) {
+                    if (slot.is_processing()) continue;
+                    if (!slot.user_id_.empty() && slot.user_id_ != want_user) continue;
+                    if (slot.prompt.n_tokens() == 0) continue;
+                    if (!ret || slot.t_last_used > t_last) {
+                        t_last = slot.t_last_used;
+                        ret = &slot;
+                    }
+                }
+            }
+
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
+                    continue;
+                }
+
+                // skip slots owned by a different user (per-user isolation)
+                if (!slot.user_id_.empty() && !task.user_id.empty() && slot.user_id_ != task.user_id) {
                     continue;
                 }
 
@@ -1605,7 +1848,9 @@ private:
             }
 
             if (ret != nullptr) {
-                SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
+                SLT_INF(*ret, "selected slot by LRU%s, t_last = %" PRId64 "\n",
+                        want_affinity && ret->user_id_ == want_user ? " (user_id affinity)" : "",
+                        t_last);
 
                 update_cache = true;
             }
@@ -1631,6 +1876,14 @@ private:
                 prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            }
+
+            // Per-user concurrency accounting: only count tasks that bind
+            // a real user_id (anonymous requests don't participate in the
+            // cap; they're throttled by the global n_parallel pool).
+            if (params_base.max_concurrent_per_user > 0 && !task.user_id.empty()) {
+                std::lock_guard<std::mutex> lock(queue_tasks.mutex_tasks);
+                user_counts_[task.user_id]++;
             }
         }
 
@@ -1683,6 +1936,10 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        SLT_INF(slot, "[PROBE] launch_slot_with_task: slot.prompt=%zu is_processing=%d seq_pos_min=%lld seq_pos_max=%lld\n",
+                slot.prompt.tokens.size(), (int)slot.is_processing(),
+                (long long)llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
+                (long long)llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -1791,6 +2048,17 @@ private:
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+        slot.user_id_ = slot.task->user_id; // remember owner for affinity + counter release
+
+        // Compute conversation hash once from the full task tokens.
+        // All checkpoints (mid-prompt and deferred) must use the same
+        // hash to prevent splitting checkpoints across conversations.
+        {
+            const auto & task_tokens = slot.task->tokens.get_tokens();
+            size_t hash_len = std::min(task_tokens.size(), (size_t)1024);
+            slot.conv_hash = kv_ssd_hash_tokens(
+                (const uint32_t *)task_tokens.data(), hash_len);
+        }
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -2290,8 +2558,111 @@ private:
         return true;
     }
 
+    // context checkpoints exist only in process memory and are not part of the
+    // llama_state_seq file format. persist them in a sidecar file so that
+    // action=restore in a fresh process can roll back mid-prompt (e.g. after a
+    // BPE boundary re-tokenization of the prompt tail) instead of re-prefilling.
+    static bool checkpoints_save_sidecar(const std::list<common_prompt_checkpoint> & checkpoints, const std::string & filepath) {
+        FILE * f = fopen(filepath.c_str(), "wb");
+        if (f == nullptr) {
+            return false;
+        }
+
+        bool ok = true;
+
+        const uint32_t magic   = 0x4C434B50; // "PKCL"
+        const uint32_t version = 1;
+        const uint32_t count   = (uint32_t) checkpoints.size();
+
+        ok = ok && fwrite(&magic,   sizeof(magic),   1, f) == 1;
+        ok = ok && fwrite(&version, sizeof(version), 1, f) == 1;
+        ok = ok && fwrite(&count,   sizeof(count),   1, f) == 1;
+
+        for (const auto & cur : checkpoints) {
+            const int64_t  n_tokens = cur.n_tokens;
+            const int32_t  pos_min  = cur.pos_min;
+            const int32_t  pos_max  = cur.pos_max;
+            const uint64_t n_tgt    = cur.data_tgt.size();
+            const uint64_t n_dft    = cur.data_dft.size();
+
+            ok = ok && fwrite(&n_tokens, sizeof(n_tokens), 1, f) == 1;
+            ok = ok && fwrite(&pos_min,  sizeof(pos_min),  1, f) == 1;
+            ok = ok && fwrite(&pos_max,  sizeof(pos_max),  1, f) == 1;
+            ok = ok && fwrite(&n_tgt,    sizeof(n_tgt),    1, f) == 1;
+            ok = ok && fwrite(&n_dft,    sizeof(n_dft),    1, f) == 1;
+            ok = ok && (n_tgt == 0 || fwrite(cur.data_tgt.data(), 1, n_tgt, f) == n_tgt);
+            ok = ok && (n_dft == 0 || fwrite(cur.data_dft.data(), 1, n_dft, f) == n_dft);
+        }
+
+        fclose(f);
+        return ok;
+    }
+
+    static bool checkpoints_load_sidecar(std::list<common_prompt_checkpoint> & checkpoints, const std::string & filepath) {
+        FILE * f = fopen(filepath.c_str(), "rb");
+        if (f == nullptr) {
+            return false;
+        }
+
+        uint32_t magic = 0, version = 0, count = 0;
+
+        bool ok = fread(&magic,   sizeof(magic),   1, f) == 1 &&
+                  fread(&version, sizeof(version), 1, f) == 1 &&
+                  fread(&count,   sizeof(count),   1, f) == 1 &&
+                  magic == 0x4C434B50 && version == 1 && count <= 1024;
+
+        std::list<common_prompt_checkpoint> loaded;
+
+        for (uint32_t i = 0; ok && i < count; ++i) {
+            auto & cur = loaded.emplace_back();
+
+            uint64_t n_tgt = 0;
+            uint64_t n_dft = 0;
+
+            ok = ok && fread(&cur.n_tokens, sizeof(cur.n_tokens), 1, f) == 1;
+            ok = ok && fread(&cur.pos_min,  sizeof(cur.pos_min),  1, f) == 1;
+            ok = ok && fread(&cur.pos_max,  sizeof(cur.pos_max),  1, f) == 1;
+            ok = ok && fread(&n_tgt,        sizeof(n_tgt),        1, f) == 1;
+            ok = ok && fread(&n_dft,        sizeof(n_dft),        1, f) == 1;
+
+            // sanity: refuse absurd blob sizes (16 GiB per blob)
+            ok = ok && n_tgt <= (1ull << 34) && n_dft <= (1ull << 34);
+
+            if (ok) {
+                cur.data_tgt.resize(n_tgt);
+                cur.data_dft.resize(n_dft);
+                ok = ok && (n_tgt == 0 || fread(cur.data_tgt.data(), 1, n_tgt, f) == n_tgt);
+                ok = ok && (n_dft == 0 || fread(cur.data_dft.data(), 1, n_dft, f) == n_dft);
+            }
+        }
+
+        fclose(f);
+
+        if (!ok) {
+            return false;
+        }
+
+        checkpoints = std::move(loaded);
+
+        return true;
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        // Evict the least-useful checkpoint when at capacity.
+        //
+        // "Least useful" = the checkpoint with the highest pos_min. The do_reset
+        // search at prefill time uses `cur.pos_min < pos_min_thold` to find a
+        // checkpoint whose recurrent state covers the LCP-aligned position. For
+        // hybrid models with bounded recurrence (Gated DeltaNet / Mamba), pos_min
+        // is bounded by the rec window size, so checkpoints with recent pos_min
+        // never satisfy the constraint for early-LCP future turns.
+        //
+        // Evicting insertion-oldest (the previous behavior) loses mid-checkpoints
+        // from long turns first when short follow-up turns add deferred finals
+        // to the same ring. That leaves the slot with only recent deferred
+        // finals, all with high pos_min, forcing do_reset to fire on every
+        // future turn whose LCP predates the latest rec window.
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -2311,13 +2682,14 @@ private:
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            auto worst = slot.prompt.checkpoints.begin();
+            for (auto it = std::next(worst); it != slot.prompt.checkpoints.end(); ++it) {
+                if (it->pos_min > worst->pos_min) worst = it;
+            }
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
-
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+                    worst->pos_min, worst->pos_max, worst->n_tokens, (float) worst->size() / 1024 / 1024);
+            slot.prompt.checkpoints.erase(worst);
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
@@ -2329,8 +2701,8 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        cur.update_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
@@ -2338,6 +2710,153 @@ private:
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+
+        // SSD-backed KV cache: store checkpoint on disk
+        if (ssd_page_manager) {
+            const auto & prefix_tokens = slot.prompt.tokens;
+            ssd_page_manager->store_checkpoint_with_tokens(
+                slot.id, ctx_tgt, ctx_dft.get(), cur,
+                prefix_tokens.get_tokens().data(),
+                prefix_tokens.get_tokens().size(),
+                ssd_turn_counter, slot.conv_hash,
+                slot.task ? slot.task->user_id : std::string());
+        }
+    }
+
+    // Deferred final checkpoint: captures full prompt state after the last
+    // batch was processed and the first generation token has been sent.
+    // Runs asynchronously relative to the client, so the ~670 MiB SSD write
+    // does not block the first token.
+    void deferred_create_final_checkpoint(server_slot & slot) {
+        if (params_base.n_ctx_checkpoints <= 0) return;
+        if (!slot.task || slot.task->type != SERVER_TASK_TYPE_COMPLETION) return;
+
+        auto done_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+        auto done_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        int64_t done_n_tokens = done_pos_max + 1;
+
+        // Cap to prevent overflow guard on warm restart.
+        // The guard subtracts 8 when n_past >= task.n_tokens; stay well below.
+        if (done_n_tokens >= (int64_t)slot.task->n_tokens()) {
+            done_n_tokens = (int64_t)slot.task->n_tokens() - 4;
+        }
+
+        if (done_pos_min < 0 || done_n_tokens < 64) return;
+        // Deferred checkpoint always captures final state. Skip the proximity
+        // guard used for mid-prompt checkpoints — the deferred ckpt is never
+        // "too close" to a prior ckpt; it's the most complete snapshot.
+
+        // Same eviction policy as create_checkpoint: prefer to keep
+        // low-pos_min checkpoints (useful for future early-LCP turns)
+        // and evict the highest-pos_min checkpoint when at capacity.
+        while (slot.prompt.checkpoints.size() >= (size_t)params_base.n_ctx_checkpoints) {
+            auto worst = slot.prompt.checkpoints.begin();
+            for (auto it = std::next(worst); it != slot.prompt.checkpoints.end(); ++it) {
+                if (it->pos_min > worst->pos_min) worst = it;
+            }
+            slot.prompt.checkpoints.erase(worst);
+        }
+        auto & cur = slot.prompt.checkpoints.emplace_back();
+
+        cur.update_pos(done_n_tokens, done_pos_min, done_pos_max);
+        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+        SLT_INF(slot,
+                "created final context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                (int)slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints,
+                cur.pos_min, cur.pos_max, cur.n_tokens,
+                (float)cur.size() / 1024 / 1024);
+
+        if (ssd_page_manager) {
+            const auto & prefix_tokens = slot.task
+                ? slot.task->tokens.get_tokens()
+                : slot.prompt.tokens.get_tokens();
+            ssd_page_manager->store_checkpoint_with_tokens(
+                slot.id, ctx_tgt, ctx_dft.get(), cur, prefix_tokens.data(),
+                prefix_tokens.size(), ssd_turn_counter, slot.conv_hash,
+                slot.task ? slot.task->user_id : std::string());
+        }
+    }
+
+    // Try to restore the system prompt section from the global SSD KV cache.
+    // Returns the n_past value after restoration (-1 on failure).
+    // Check if this slot's current prompt represents a system prompt
+    // that should be stored in the global cache.
+    void maybe_extract_system_prompt(server_slot & slot) {
+        if (!sys_cache || !ssd_page_manager) {
+            return;
+        }
+
+        // Only extract once per slot
+        auto it = slot_sys_hash.find(slot.id);
+        if (it != slot_sys_hash.end() && it->second != 0) {
+            return;
+        }
+
+        const auto & tokens = slot.task->tokens.get_tokens();
+        if (tokens.empty()) {
+            return;
+        }
+
+        int n_sys = kv_detect_system_prompt_boundary(
+            llama_model_get_vocab(llama_get_model(ctx_tgt)),
+            tokens.data(),
+            (int32_t)tokens.size(),
+            params_base.chat_template.empty() ? nullptr : params_base.chat_template.c_str());
+
+        if (n_sys <= 0 || n_sys >= (int32_t)tokens.size()) {
+            slot_sys_hash[slot.id] = 1;  // mark as checked, nothing to do
+            return;
+        }
+
+        // MIN_USEFUL_SYS_TOKENS: don't cache trivial system sections
+        // (chat template header with no actual system message). The
+        // per-conversation SSD cache handles these cases. This also
+        // prevents false-positive boundary detection from filling
+        // the system cache with near-empty entries.
+        const int32_t MIN_USEFUL_SYS_TOKENS = 16;
+        if (n_sys < MIN_USEFUL_SYS_TOKENS) {
+            slot_sys_hash[slot.id] = 1;
+            return;
+        }
+
+        // Get the state at the system prompt boundary
+        size_t state_size = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (state_size == 0) {
+            slot_sys_hash[slot.id] = 1;
+            return;
+        }
+
+        std::vector<uint8_t> state_data(state_size);
+        size_t got = llama_state_seq_get_data_ext(ctx_tgt, state_data.data(),
+            state_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        if (got == 0) {
+            slot_sys_hash[slot.id] = 1;
+            return;
+        }
+
+        // Store in system prompt cache
+        sys_cache->store((const uint32_t*)tokens.data(), (uint32_t)n_sys,
+                         state_data.data(), (size_t)got);
+
+        slot_sys_hash[slot.id] = 1;
+        SLT_INF(slot, "stored system prompt cache entry: n_sys=%d, size=%zu bytes\n",
+                n_sys, (size_t)got);
+    }
+
+    // Called when a slot finishes processing (turn complete).
+    // Bumps the turn counter for SSD cache tiering.
+    void on_turn_complete(server_slot & slot) {
+        ssd_turn_counter++;
+
+        // Store the final state to SSD
+        if (ssd_page_manager && slot.prompt.n_tokens() > 0) {
+            ssd_page_manager->on_turn_complete(ssd_turn_counter);
+        }
+
+        // Clean up per-slot state
+        slot_sys_hash.erase(slot.id);
     }
 
     void process_single_task(server_task && task) {
@@ -2538,6 +3057,16 @@ private:
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
+                    // persist context checkpoints alongside the state file so that a
+                    // restore in a fresh process can roll back mid-prompt (see restore path)
+                    if (!slot->prompt.checkpoints.empty()) {
+                        if (checkpoints_save_sidecar(slot->prompt.checkpoints, filepath + ".ckpt")) {
+                            SLT_INF(*slot, "saved %zu context checkpoints to sidecar\n", slot->prompt.checkpoints.size());
+                        } else {
+                            SLT_WRN(*slot, "failed to write checkpoint sidecar %s\n", (filepath + ".ckpt").c_str());
+                        }
+                    }
+
                     auto res = std::make_unique<server_task_result_slot_save_load>();
                     res->id       = task.id;
                     res->id_slot  = id_slot;
@@ -2580,6 +3109,24 @@ private:
                     tokens.resize(token_count);
                     slot->prompt.clear();
                     slot->prompt.tokens.insert(tokens);
+
+                    // reload the context checkpoints written at save time; without them the
+                    // next request's rollback finds no usable cache data and forces a full
+                    // re-prefill ("forcing full prompt re-processing due to lack of cache
+                    // data"). if no sidecar exists (state saved by an older build), fall back
+                    // to synthesizing a tip checkpoint from the just-restored state, which at
+                    // least covers exact continuations.
+                    if (params_base.n_ctx_checkpoints > 0 && token_count > 0) {
+                        if (checkpoints_load_sidecar(slot->prompt.checkpoints, filepath + ".ckpt")) {
+                            SLT_INF(*slot, "restored %zu context checkpoints from sidecar\n", slot->prompt.checkpoints.size());
+                        } else {
+                            const llama_pos p_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot->id);
+                            const llama_pos p_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot->id);
+                            if (p_min >= 0 && p_max >= p_min) {
+                                create_checkpoint(*slot, 0, p_min, p_max);
+                            }
+                        }
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -2885,8 +3432,8 @@ private:
                 common_context_seq_add(ctx_tgt, slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
 
                 if (ctx_dft) {
-                    common_context_seq_rm (ctx_dft, slot.id, n_keep            , n_keep + n_discard);
-                    common_context_seq_add(ctx_dft, slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+                    common_context_seq_rm (ctx_dft.get(), slot.id, n_keep            , n_keep + n_discard);
+                    common_context_seq_add(ctx_dft.get(), slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
                 }
 
                 // add generated tokens to cache
@@ -2958,7 +3505,7 @@ private:
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
                         if (use_ckpt_dft) {
-                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            slot.spec_ckpt.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
@@ -2995,10 +3542,10 @@ private:
 
             if (ctx_dft) {
                 if (use_ckpt_dft) {
-                    ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
 
-                common_context_seq_rm(ctx_dft, slot.id, ckpt.pos_max + 1, -1);
+                common_context_seq_rm(ctx_dft.get(), slot.id, ckpt.pos_max + 1, -1);
             }
 
             if (!draft.empty()) {
@@ -3007,7 +3554,7 @@ private:
                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt));
 
                 const bool use_ckpt_dft =
-                   (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
+                   (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft.get()));
 
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
@@ -3024,7 +3571,7 @@ private:
                 }
 
                 if (use_ckpt_dft) {
-                    ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
             }
         });
@@ -3097,6 +3644,166 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
+                        SLT_INF(slot, "[PROBE] prefill-init n_past=0 slot.prompt=%zu ssd_page_manager=%d cache_prompt=%d\n",
+                                slot.prompt.tokens.size(), (int)(ssd_page_manager != nullptr), (int)slot.task->params.cache_prompt);
+
+                        // cold start: try per-conversation SSD checkpoint restore
+                        // Must populate slot.prompt.tokens so get_common_prefix() finds the match
+                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && ssd_page_manager) {
+                            const auto & task_tokens = slot.task->tokens.get_tokens();
+                            if (!task_tokens.empty()) {
+                                int32_t ssd_pos_min = 0, ssd_pos_max = 0;
+                                uint64_t ssd_n_tokens = 0;
+                                int32_t ssd_lcp = 0;
+                                float ssd_overlap = 0.0f;
+                                bool ssd_is_continuation = false;
+                                std::vector<uint8_t> ssd_spec_data;
+                                if (ssd_page_manager->find_and_load_checkpoint(
+                                        task_tokens.data(), task_tokens.size(),
+                                        ssd_turn_counter, ctx_tgt, ctx_dft.get(),
+                                        (uint32_t)slot.id,
+                                        ssd_pos_min, ssd_pos_max, ssd_n_tokens,
+                                        &ssd_spec_data,
+                                        slot.conv_hash, 0, (uint64_t)task_tokens.size(),
+                                        &ssd_lcp, &ssd_overlap, &ssd_is_continuation,
+                                        slot.task->user_id)) {
+                                    // Hybrid model LCP validation. Recurrent state is
+                                    // content-dependent - if the LCP is much smaller than
+                                    // the checkpoint's n_tokens, the recurrent state beyond
+                                    // the LCP is from a different conversation and will
+                                    // produce garbage logits (all -inf, sampler crash).
+                                    //
+                                    // Three cases:
+                                    //   1. lcp >= n_tokens: full coverage, recurrent state valid
+                                    //   2. lcp >= PREFIX_MAX (4096) AND overlap >= 99%:
+                                    //      same-conversation checkpoint with full prefix match
+                                    //   3. lcp < PREFIX_MAX: partial coverage, cap n_past to LCP
+                                    //
+                                    // For dense models the recurrent layer is replaced by full
+                                    // attention, so this gate is a no-op for them.
+                                    if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS
+                                            && ssd_lcp > 0 && ssd_n_tokens > 0) {
+                                        const uint64_t validated_tokens = std::min(
+                                            ssd_n_tokens, (uint64_t)KV_SSD_TOKEN_PREFIX_MAX);
+                                        const float MIN_LCP_RATIO = 0.80f;
+                                        float lcp_ratio = (float)ssd_lcp / (float)validated_tokens;
+                                        bool full_coverage =
+                                            ssd_lcp >= (int32_t)ssd_n_tokens ||
+                                            (ssd_lcp >= (int32_t)KV_SSD_TOKEN_PREFIX_MAX
+                                             && ssd_overlap >= 0.99f);
+                                        if (!full_coverage && lcp_ratio < MIN_LCP_RATIO) {
+                                            SLT_WRN(slot, "cold-start: rejecting SSD checkpoint for hybrid model "
+                                                    "(lcp=%d < 80%% of validated=%lu/n_tokens=%lu, ratio=%.1f%%, overlap=%.1f%%)\n",
+                                                    ssd_lcp, (unsigned long)validated_tokens, (unsigned long)ssd_n_tokens,
+                                                    lcp_ratio * 100.0f, ssd_overlap * 100.0f);
+                                            // Clear the loaded state and reset
+                                            llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                                            n_past = 0;
+                                            slot.prompt.tokens.clear();
+                                            ssd_n_tokens = 0;
+                                        } else if (!full_coverage) {
+                                            // Partial coverage: cap n_past to LCP so only
+                                            // validated recurrent state is used.
+                                            SLT_INF(slot, "SSD hybrid model partial-coverage: "
+                                                    "lcp=%d ssd_n_tokens=%lu cap to LCP\n",
+                                                    ssd_lcp, (unsigned long)ssd_n_tokens);
+                                            llama_memory_seq_rm_attn_only(
+                                                llama_get_memory(ctx_tgt), slot.id, ssd_lcp, -1);
+                                            // Attention state is only valid up to LCP for hybrid models
+                                            n_past = ssd_lcp;
+                                        }
+                                    }
+
+                                    if (ssd_n_tokens > 0) {
+                                    // Push checkpoint's full token count.
+                                    // ssd_lcp from find_match is capped at
+                                    // KV_SSD_TOKEN_PREFIX_MAX (4096), but
+                                    // same-conversation checkpoints match
+                                    // for all n_tokens. Use ssd_n_tokens
+                                    // directly for the full coverage.
+                                    int32_t n_push = (int32_t)std::min((uint64_t)task_tokens.size(), ssd_n_tokens);
+                                    for (int32_t i = 0; i < n_push; i++) {
+                                        slot.prompt.tokens.push_back(task_tokens[i]);
+                                    }
+                                    SLT_INF(slot, "SSD cache restore: lcp=%d ssd_n_tokens=%lu pos=[%d,%d] n_push=%d overlap=%.1f%% continuation=%d\n",
+                                            ssd_lcp, (unsigned long)ssd_n_tokens, ssd_pos_min, ssd_pos_max, n_push,
+                                            ssd_overlap * 100.0f, (int)ssd_is_continuation);
+
+                                    // Create in-memory checkpoint so downstream
+                                    // checkpoint search finds it. pos_min=0
+                                    // triggers the cur.pos_min==0 match in
+                                    // the lambda. Empty data vectors mean
+                                    // load_tgt/load_dft are no-ops — the
+                                    // SSD restore already loaded full state.
+                                    auto & ckpt = slot.prompt.checkpoints.emplace_back();
+                                    ckpt.update_pos(n_push, 0, (llama_pos)n_push);
+
+                                    // Restore speculative impl state (pending_h for MTP)
+                                    // so the first draft after cold-start is consistent.
+                                    if (spec && !ssd_spec_data.empty()) {
+                                        common_speculative_set_state(spec.get(), slot.id, ssd_spec_data);
+                                    }
+
+                                    // Flag that SSD cache restored this slot.
+                                    slot.ssd_cold_start_used = true;
+                                    // For hybrid models with partial coverage, n_past was already set to ssd_lcp above.
+                                    // For full coverage (hybrid or dense), set n_past to n_push.
+                                    if (n_past == 0) {
+                                        n_past = n_push;
+                                    }
+                                    } // ssd_n_tokens > 0 (not rejected by hybrid LCP check)
+                                }
+                            }
+                        }
+
+                        // cold start: try SSD system prompt cache restore (global, cross-conversation)
+                        // Only cold starts (empty slot) need system prompt cache.
+                        // Warm slots (n_tokens > 0) already have full context from
+                        // the in-memory prompt cache LCP restore or previous turn.
+                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && sys_cache && ssd_page_manager) {
+                            const auto & task_tokens = slot.task->tokens.get_tokens();
+                            int n_sys = kv_detect_system_prompt_boundary(
+                                llama_model_get_vocab(llama_get_model(ctx_tgt)),
+                                task_tokens.data(),
+                                (int32_t)task_tokens.size(),
+                                params_base.chat_template.empty() ? nullptr : params_base.chat_template.c_str());
+
+                            // MIN_USEFUL_SYS_TOKENS: skip system prompt cache when the
+                            // detected boundary is too small (just a chat template header
+                            // with no system message). The per-conversation SSD cache
+                            // handles these cases with full prompt state restore.
+                            const int32_t MIN_USEFUL_SYS_TOKENS = 16;
+                            if (n_sys >= MIN_USEFUL_SYS_TOKENS && n_sys < (int32_t)task_tokens.size()) {
+                                uint64_t sys_hash = kv_ssd_system_cache::hash_tokens(
+                                    (const uint32_t*)task_tokens.data(), (size_t)n_sys);
+
+                                std::vector<uint8_t> sys_data;
+                                if (sys_cache->load((const uint32_t*)task_tokens.data(),
+                                                    (uint32_t)n_sys, sys_data)) {
+                                    // Restore system prompt state from cache
+                                    // Match the save flag (PARTIAL_ONLY) used by
+                                    // maybe_extract_system_prompt(). The system prompt
+                                    // cache only stores recurrent memory state, not
+                                    // attention KV cache. Loading with NONE would try
+                                    // to read attention data that isn't there.
+                                    if (llama_state_seq_set_data_ext(ctx_tgt, sys_data.data(),
+                                            sys_data.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) > 0) {
+                                        n_past = n_sys;
+
+                                        // Populate slot.prompt.tokens so get_common_prefix()
+                                        // finds the match and preserves n_past. Without this,
+                                        // get_common_prefix() returns 0 on empty tokens and
+                                        // the restored state is wiped by seq_rm(ctx, 0, -1).
+                                        for (int32_t i = 0; i < n_sys; i++) {
+                                            slot.prompt.tokens.push_back(task_tokens[i]);
+                                        }
+
+                                        SLT_INF(slot, "system prompt cache hit: hash=%016lx, n_sys=%d\n",
+                                                sys_hash, n_sys);
+                                    }
+                                }
+                            }
+                        }
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -3152,6 +3859,8 @@ private:
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                SLT_INF(slot, "[PROBE] LCP n_past=%d slot.prompt=%zu task=%d\n",
+                                        n_past, slot.prompt.tokens.size(), slot.task->n_tokens());
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
@@ -3205,8 +3914,8 @@ private:
                                             common_context_seq_add(ctx_tgt, slot.id, head_c, head_c + n_match, kv_shift);
 
                                             if (ctx_dft) {
-                                                common_context_seq_rm (ctx_dft, slot.id, head_p, head_c);
-                                                common_context_seq_add(ctx_dft, slot.id, head_c, head_c + n_match, kv_shift);
+                                                common_context_seq_rm (ctx_dft.get(), slot.id, head_p, head_c);
+                                                common_context_seq_add(ctx_dft.get(), slot.id, head_c, head_c + n_match, kv_shift);
                                             }
 
                                             for (size_t i = 0; i < n_match; i++) {
@@ -3226,6 +3935,7 @@ private:
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
+                                SLT_INF(slot, "[PROBE] cache_prompt=FALSE -> n_past=0 (probe=%d)\n", 1);
                             }
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
@@ -3235,9 +3945,14 @@ private:
 
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
+                            SLT_INF(slot, "[PROBE] pre-reset n_past=%d pos_next=%d n_swa=%d has_new=%d pos_min_thold=%d n_ckpts=%zu ssd_cold=%d\n",
+                                    n_past, (int)pos_next, n_swa, (int)has_new_tokens, pos_min_thold,
+                                    slot.prompt.checkpoints.size(), (int)slot.ssd_cold_start_used);
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+                                SLT_INF(slot, "[PROBE] in-block n_past=%d pos_min=%d pos_min_thold=%d\n",
+                                        n_past, pos_min, pos_min_thold);
                                 if (pos_min == -1) {
                                     SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
                                     GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen: https://github.com/ggml-org/llama.cpp/pull/13833#discussion_r2116181237");
@@ -3306,21 +4021,105 @@ private:
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        it->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        SLT_INF(slot, "[PROBE] ckpt-restored n_past=%d ckpt=[%d,%d]\n",
+                                                n_past, it->pos_min, it->pos_max);
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+
+                                        // after restoring a checkpoint, the recurrent state positions
+                                        // may not align with token indices on hybrid models (MoE/SSM).
+                                        // use seq_rm_attn_only instead of full seq_rm to avoid crash
+                                        slot.ssd_cold_start_used = true;
                                     }
 
                                     if (do_reset) {
+                                        SLT_INF(slot, "[PROBE] do_reset=true -> n_past=0 (no usable ckpt, probe=%d)\n", 1);
                                         SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
                                         n_past = 0;
+                                    }
+                                }
+                            }
+
+                            // do_reset fallback for warm slots: when LCP matched deeply
+                            // through the system prompt but no in-memory checkpoint covers
+                            // the LCP position (hybrid/MoE models with bounded rec window),
+                            // the system prompt cache may still hold the recurrent state
+                            // for tokens [0, n_sys). Without this fallback, every turn that
+                            // grows past the rec window forces a full reprocess of the
+                            // system prompt on the next user input. The cold-start path
+                            // already does this, but only when slot.prompt is empty.
+                            //
+                            // Tries prefix-match if exact load fails: scans stored entries
+                            // for one whose first K tokens match the new task's first K
+                            // tokens. This handles the common case where the chat template
+                            // inserts a few dynamic tokens between the system section and
+                            // the first user message, shifting the boundary by tens of
+                            // tokens between turns.
+                            if (n_past == 0 && slot.prompt.n_tokens() > 0 && sys_cache && ssd_page_manager) {
+                                const auto & task_tokens = slot.task->tokens.get_tokens();
+                                int n_sys = kv_detect_system_prompt_boundary(
+                                    llama_model_get_vocab(llama_get_model(ctx_tgt)),
+                                    task_tokens.data(),
+                                    (int32_t)task_tokens.size(),
+                                    params_base.chat_template.empty() ? nullptr : params_base.chat_template.c_str());
+
+                                const int32_t MIN_USEFUL_SYS_TOKENS = 16;
+                                const uint32_t MIN_PREFIX_MATCH = 64;
+
+                                int recovered_n_sys = 0;
+                                std::vector<uint8_t> sys_data;
+                                bool recovered = false;
+
+                                if (n_sys >= MIN_USEFUL_SYS_TOKENS && n_sys < (int32_t)task_tokens.size()) {
+                                    if (sys_cache->load((const uint32_t*)task_tokens.data(),
+                                                        (uint32_t)n_sys, sys_data)) {
+                                        recovered_n_sys = n_sys;
+                                        recovered = true;
+                                    } else if ((uint32_t)n_sys >= MIN_PREFIX_MATCH &&
+                                               sys_cache->load_prefix((const uint32_t*)task_tokens.data(),
+                                                       (uint32_t)n_sys, MIN_PREFIX_MATCH, sys_data)) {
+                                        // Prefix fallback matched. Use the boundary as
+                                        // n_past - the loaded state's recurrent state covers
+                                        // up to the stored entry's n_tokens, but for hybrid
+                                        // models the state at position N is computed from
+                                        // tokens [0, N). If the first 64+ tokens match we
+                                        // accept the approximate match; any model state drift
+                                        // is bounded by the small divergent region at the
+                                        // boundary.
+                                        recovered_n_sys = n_sys;
+                                        recovered = true;
+                                        SLT_INF(slot, "[PROBE] sys-cache-fallback prefix-match recovered at n_sys=%d (exact match failed)\n",
+                                                n_sys);
+                                    }
+                                }
+
+                                if (recovered) {
+                                    if (llama_state_seq_set_data_ext(ctx_tgt, sys_data.data(),
+                                            sys_data.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) > 0) {
+                                        n_past = recovered_n_sys;
+                                        pos_next = recovered_n_sys;
+                                        // Replace stale tokens from the previous turn with
+                                        // the new task's first n_sys tokens. Stale tokens
+                                        // would corrupt the prefill loop after n_past jumps.
+                                        slot.prompt.tokens.keep_first(0);
+                                        for (int32_t i = 0; i < recovered_n_sys; i++) {
+                                            slot.prompt.tokens.push_back(task_tokens[i]);
+                                        }
+                                        // Route seq_rm through seq_rm_attn_only so the loaded
+                                        // recurrent state is preserved (attention is empty for
+                                        // the system section and will be filled as prefill
+                                        // processes the remaining tokens).
+                                        slot.ssd_cold_start_used = true;
+                                        SLT_INF(slot, "[PROBE] sys-cache-fallback n_past=%d (n_sys=%d) after do_reset\n",
+                                                n_past, recovered_n_sys);
                                     }
                                 }
                             }
@@ -3345,6 +4144,8 @@ private:
                             n_past--;
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
+                        SLT_INF(slot, "[PROBE] FINAL n_past=%d task.n=%d slot.prompt=%zu\n",
+                                n_past, slot.task->n_tokens(), slot.prompt.tokens.size());
 
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
@@ -3374,14 +4175,50 @@ private:
                     slot.t_prompt_processing = (t_now - slot.t_start_process_prompt) / 1e3;
                     slot.print_timings_pp();
 
-                    // truncate any tokens that are beyond n_past for this slot
-                    const llama_pos p0 = slot.prompt.tokens.pos_next();
+                    // truncate any tokens that are beyond n_past for this slot.
+                    // skip when a checkpoint restored state (SSD cache or in-memory).
+                    // a full common_context_seq_rm is unsafe on hybrid because it
+                    // routes through mem_recr->seq_rm, whose n_rs_seq rollback path
+                    // can fail when the saved checkpoint's position range extends
+                    // past n_past (e.g., previous turn's generation tokens beyond
+                    // LCP). the seq_rm_attn_only path handles both caches safely.
+                    // See: https://github.com/fewtarius/llama-ai/issues/8
+                    if (!slot.ssd_cold_start_used) {
+                        const llama_pos p0 = slot.prompt.tokens.pos_next();
 
-                    SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
+                        SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
-                    if (ctx_dft) {
-                        common_context_seq_rm(ctx_dft, slot.id, p0, -1);
+                        common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
+                        if (ctx_dft) {
+                            common_context_seq_rm(ctx_dft.get(), slot.id, p0, -1);
+                        }
+                    } else {
+                        // For SSD/in-memory restored slots on hybrid models:
+                        // clear attn cells AND stale position tracking in mem_recr.
+                        //
+                        // full common_context_seq_rm is unsafe on hybrid because
+                        // seq_rm's n_rs_seq rollback path can fail when rollback
+                        // exceeds n_rs_seq (mamba/GDN models). the seq_rm_attn_only
+                        // path calls mem_attn->seq_rm (regular, frees cells) AND
+                        // mem_recr->seq_rm_positions_only (clears seq_id without
+                        // touching data - no rollback path).
+                        //
+                        // both are required: without clearing mem_recr's stale
+                        // positions, hybrid seq_pos_max (min of attn+recr) would
+                        // still report the stale value, and llama_batch_init
+                        // validation fails on the next batch. See issue #8.
+                        const llama_pos p0 = slot.prompt.tokens.pos_next();
+                        SLT_DBG(slot, "SSD used, seq_rm_attn_only [%d, end)\n", p0);
+                        auto * mem = llama_get_memory(ctx_tgt);
+                        if (mem) {
+                            llama_memory_seq_rm_attn_only(mem, slot.id, p0, -1);
+                        }
+                        if (ctx_dft) {
+                            mem = llama_get_memory(ctx_dft.get());
+                            if (mem) {
+                                llama_memory_seq_rm_attn_only(mem, slot.id, p0, -1);
+                            }
+                        }
                     }
 
                     // If using an alora, there may be uncached tokens that come
@@ -3522,6 +4359,9 @@ private:
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
+                        // Extract system prompt for cross-conversation SSD cache
+                        maybe_extract_system_prompt(slot);
+
                         GGML_ASSERT(batch.size() > 0);
 
                         // extract the logits only for the last token
@@ -3534,7 +4374,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!is_user_start && !(params_base.checkpoint_near_end && near_prompt_end)) {
                             do_checkpoint = false;
                         }
                     }
@@ -3554,7 +4394,7 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || (params_base.checkpoint_near_end && near_prompt_end) ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
@@ -3734,6 +4574,13 @@ private:
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
+                // Defer final checkpoint SSD I/O to after first token.
+                // The inline mid-prompt checkpoints were created during
+                // prompt processing; this final checkpoint captures the
+                // full prompt state after the last batch was processed,
+                // so warm restarts can skip nearly all prompt tokens.
+                slot.deferred_final_checkpoint = true;
+
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                 }
@@ -3784,12 +4631,25 @@ private:
 
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
+                if (slot.deferred_final_checkpoint) {
+                    slot.deferred_final_checkpoint = false;
+                    deferred_create_final_checkpoint(slot);
+                }
                 slot.print_timings();
                 send_final_response(slot);
                 metrics.on_prediction(slot);
                 slot.release();
 
                 return;
+            }
+
+            // Defer final checkpoint after first token is sent.
+            // The inline mid-prompt checkpoints in create_checkpoint()
+            // were created before the last batch; this captures the
+            // full prompt state so warm restarts skip nearly all tokens.
+            if (slot.deferred_final_checkpoint) {
+                slot.deferred_final_checkpoint = false;
+                deferred_create_final_checkpoint(slot);
             }
 
             slot.print_timings_tg();
@@ -3906,6 +4766,10 @@ private:
                 slot.n_decoded += 1;
 
                 if (!process_token(result, slot)) {
+                    if (slot.deferred_final_checkpoint) {
+                        slot.deferred_final_checkpoint = false;
+                        deferred_create_final_checkpoint(slot);
+                    }
                     slot.print_timings();
                     send_final_response(slot);
                     metrics.on_prediction(slot);
@@ -3913,6 +4777,12 @@ private:
 
                     return;
                 }
+            }
+
+            // Defer final checkpoint after first token(s) sent
+            if (slot.deferred_final_checkpoint) {
+                slot.deferred_final_checkpoint = false;
+                deferred_create_final_checkpoint(slot);
             }
 
             slot.print_timings_tg();
@@ -4053,12 +4923,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     auto & rd = res->rd;
     auto & params = this->params;
 
+    std::vector<server_task> tasks;
     res->set_req(&req); // will also set spipe if needed
-
     int32_t sse_ping_interval = params.sse_ping_interval;
 
     try {
-        std::vector<server_task> tasks;
+        tasks.clear();
 
         const auto & prompt = data.at("prompt");
         // TODO: this log can become very long, put it behind a flag or think about a more compact format
@@ -4109,6 +4979,18 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
 
+            // Operator-supplied user identity. The HTTP layer may also
+            // synthesize a tenant/user label via metadata->user_id; the
+            // raw field is the canonical CachyLLama form. Empty value is
+            // valid (anonymous bucket, no per-user cap).
+            try {
+                task.user_id = server_task::validate_user_id(
+                    json_value(data, "llama_user_id", std::string()));
+            } catch (const std::invalid_argument & e) {
+                throw std::invalid_argument(
+                    std::string("invalid llama_user_id: ") + e.what());
+            }
+
             // OAI-compat
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
@@ -4129,6 +5011,34 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     } catch (const std::exception & e) {
         res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
         return res;
+    }
+
+    // Per-user concurrency cap fast-fail (HTTP 429). After the request is
+    // queued, we can immediately tell if the user is over cap. The slow
+    // path (queue->get_available_slot returning nullptr) also enforces
+    // this, but the fast path saves a queue round-trip and a log of
+    // deferred tasks. We only check tasks carrying a non-empty user_id;
+    // anonymous requests are throttled only by the global n_parallel.
+    if (params.max_concurrent_per_user > 0) {
+        std::string first_user_id;
+        for (const auto & t : tasks) {
+            if (!t.user_id.empty()) {
+                first_user_id = t.user_id;
+                break;
+            }
+        }
+        if (!first_user_id.empty()) {
+            const int cur = ctx_server.get_active_user_count(first_user_id);
+            if (cur >= params.max_concurrent_per_user) {
+                res->error(format_error_response(
+                    "user '" + first_user_id + "' is at the per-user concurrency cap of " +
+                    std::to_string(params.max_concurrent_per_user) +
+                    " (currently " + std::to_string(cur) + " in-flight). " +
+                    "Retry after in-flight requests complete.",
+                    ERROR_TYPE_RATE_LIMIT));
+                return res;
+            }
+        }
     }
 
     bool stream = json_value(data, "stream", false);
@@ -4540,7 +5450,6 @@ void server_routes::init_routes() {
             { "default_generation_settings", default_generation_settings_for_props },
             { "total_slots",                 params.n_parallel },
             { "model_alias",                 meta->model_name },
-            { "model_ftype",                 meta->model_ftype },
             { "model_path",                  meta->model_path },
             { "modalities",                  json {
                 {"vision", meta->has_inp_image},
