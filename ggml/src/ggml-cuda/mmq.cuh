@@ -218,6 +218,7 @@ struct ggml_cuda_mmq_config {
 
 #include "mmq-config-cdna.cuh"
 #include "mmq-config-rdna2.cuh"
+#include "mmq-config-rdna3_5.cuh"
 #include "mmq-config-rdna4.cuh"
 
 #undef CASE
@@ -226,6 +227,9 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
     if (GGML_CUDA_CC_IS_AMD(cc)) {
         if (GGML_CUDA_CC_IS_CDNA(cc)) {
             return ggml_cuda_mmq_get_config_cdna(type, J, fallback);
+        }
+        if (GGML_CUDA_CC_IS_RDNA3_5(cc)) {
+            return ggml_cuda_mmq_get_config_rdna3_5(type, J, fallback);
         }
         if (amd_wmma_available(cc)) {
             return ggml_cuda_mmq_get_config_rdna4(type, J, fallback);
@@ -245,6 +249,8 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
 #ifdef GGML_USE_HIP
 #ifdef CDNA
     return ggml_cuda_mmq_get_config_cdna(type, J, fallback);
+#elif defined(RDNA3_5)
+    return ggml_cuda_mmq_get_config_rdna3_5(type, J, fallback);
 #elif defined(AMD_WMMA_AVAILABLE)
     return ggml_cuda_mmq_get_config_rdna4(type, J, fallback);
 #else
@@ -813,6 +819,28 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
     return ggml_cuda_mmq_get_util_funcs<type, J, fallback>().write_back;
 }
 
+// Per-thread entries in the `sum[]` accumulator used by `mul_mat_q_process_tile`.
+// The accumulator is consumed by BOTH the dp4a write_back path (indexed as
+// (j0/nwarps)*(I/warp_size) + i0/warp_size) AND the MMA write_back path
+// (indexed as (j0/tile_C::J + n)*tile_C::ne + l). The MMA path can write
+// past the dp4a allocation, particularly when J is not a multiple of
+// tile_C::J (the inner loop runs the full ntx*ceil(J/tile_C::J) iterations
+// even for the tail tile). RDNA3.5 with tile_C<16,16>, ntx=1, tile_C::ne=8
+// needs ceil(J/16)*8 entries; the worst case across known MMA configs
+// (non-AMD tile<16,8> with ntx=2, tile_C::ne=4) needs ceil(J/8)*8.
+template <ggml_type type, int J, bool fallback>
+static constexpr int mmq_get_sum_size() {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+
+    constexpr int sum_dp4a = ((J + nwarps - 1) / nwarps)
+                            * ((I + warp_size - 1) / warp_size);
+    constexpr int sum_mma  = ((J + 7) / 8) * 8;
+
+    return sum_dp4a > sum_mma ? sum_dp4a : sum_mma;
+}
+
 // ---------------------------------------------------------------------------------------------
 
 template <ggml_type type, int J, bool fallback, bool fixup>
@@ -844,7 +872,11 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int ITER_K          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
     constexpr int blocks_per_iter = ITER_K / qk;
 
-    float sum[J*I / (nwarps*warp_size)] = {0.0f};
+    // Sized for the larger of the dp4a and MMA per-thread accumulator layouts
+    // (see mmq_get_sum_size); the original `J*I/(nwarps*warp_size)` under-sized
+    // the MMA path on RDNA3.5 (gfx1151), which was the root cause of
+    // fewtarius/llama-ai#8 mul_mat_q HSA memory faults for Q4_0 J=40.
+    float sum[mmq_get_sum_size<type, J, fallback>()] = {0.0f};
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
