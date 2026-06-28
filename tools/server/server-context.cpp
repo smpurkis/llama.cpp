@@ -3306,6 +3306,7 @@ private:
                                 if (ssd_page_manager->find_and_load_checkpoint(
                                         task_tokens.data(), task_tokens.size(),
                                         ssd_turn_counter, ctx_tgt, ctx_dft.get(),
+                                        (uint32_t)slot.id,
                                         ssd_pos_min, ssd_pos_max, ssd_n_tokens,
                                         &ssd_spec_data,
                                         slot.conv_hash, 0, (uint64_t)task_tokens.size(), &ssd_lcp)) {

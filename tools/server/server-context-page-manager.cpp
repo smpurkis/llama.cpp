@@ -462,6 +462,7 @@ bool server_context_page_manager::find_and_load_checkpoint(
     uint32_t current_turn,
     struct llama_context* ctx,
     struct llama_context* ctx_dft,
+    uint32_t dest_seq_id,
     int32_t& out_pos_min,
     int32_t& out_pos_max,
     uint64_t& out_n_tokens,
@@ -487,7 +488,7 @@ bool server_context_page_manager::find_and_load_checkpoint(
         // Prefetch the checkpoint file from SSD while we prepare to load it.
         sc->prefetch(ckpt_id);
 
-        bool ok = sc->load(ckpt_id, ctx, ctx_dft, out_pos_min, out_pos_max, out_n_tokens, out_spec_data);
+        bool ok = sc->load(ckpt_id, ctx, ctx_dft, out_pos_min, out_pos_max, out_n_tokens, out_spec_data, dest_seq_id);
         if (ok) {
             cache_hits_++;
             if (out_lcp) *out_lcp = match_lcp;
