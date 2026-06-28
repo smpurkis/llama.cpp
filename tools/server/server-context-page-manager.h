@@ -126,12 +126,15 @@ public:
     // Find matching checkpoint by token prefix and restore to VRAM (cross-session restart)
     // Routes to per-conversation cache. Falls back to continuation detection
     // across all conversation directories if conv_hash isn't known yet.
+    // dest_seq_id: current slot's seq_id — KV cells are restored under this id so that
+    // llama_memory_seq_pos_min() returns a valid value for the slot after restore.
     bool find_and_load_checkpoint(
         const llama_token* tokens,
         size_t tokens_size,
         uint32_t current_turn,
         struct llama_context* ctx,
         struct llama_context* ctx_dft,
+        uint32_t dest_seq_id,
         int32_t& out_pos_min,
         int32_t& out_pos_max,
         uint64_t& out_n_tokens,

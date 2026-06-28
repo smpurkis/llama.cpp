@@ -63,20 +63,25 @@ bool server_ssd_cache::load(uint64_t checkpoint_id,
                             int32_t& out_pos_min,
                             int32_t& out_pos_max,
                             uint64_t& out_n_tokens,
-                            std::vector<uint8_t>* out_spec_data)
+                            std::vector<uint8_t>* out_spec_data,
+                            uint32_t dest_seq_id)
 {
     if (!cache_ || !ctx || checkpoint_id == 0) return false;
 
     const kv_ssd_checkpoint* meta = kv_ssd_get_meta(cache_, checkpoint_id);
     if (!meta) return false;
 
+    // Use the caller-supplied destination seq_id (current slot's id) when provided.
+    // Falls back to meta->slot_id for same-slot loads where they are guaranteed equal.
+    const uint32_t seq_id = (dest_seq_id != UINT32_MAX) ? dest_seq_id : meta->slot_id;
+
     std::vector<uint8_t> tgt_data;
     std::vector<uint8_t> dft_data;
     std::vector<uint8_t> spec_data;
     if (!kv_ssd_load(cache_, checkpoint_id, tgt_data, &dft_data, &spec_data)) return false;
 
-    // Restore tgt state (recurrent + KV cache)
-    if (llama_state_seq_set_data_ext(ctx, tgt_data.data(), tgt_data.size(), meta->slot_id, 0) == 0) {
+    // Restore tgt state (recurrent + KV cache) under the current slot's seq_id
+    if (llama_state_seq_set_data_ext(ctx, tgt_data.data(), tgt_data.size(), (int32_t)seq_id, 0) == 0) {
         LOG_WRN("SSD cache: failed to restore tgt state for checkpoint %lu\n",
                 (unsigned long)checkpoint_id);
         return false;
@@ -84,7 +89,7 @@ bool server_ssd_cache::load(uint64_t checkpoint_id,
 
     // Restore dft state (MTP KV cache) if it was saved and caller provided ctx_dft
     if (ctx_dft && !dft_data.empty()) {
-        if (llama_state_seq_set_data_ext(ctx_dft, dft_data.data(), dft_data.size(), meta->slot_id, 0) == 0) {
+        if (llama_state_seq_set_data_ext(ctx_dft, dft_data.data(), dft_data.size(), (int32_t)seq_id, 0) == 0) {
             LOG_WRN("SSD cache: failed to restore dft state for checkpoint %lu - MTP will catch up\n",
                     (unsigned long)checkpoint_id);
         }
