@@ -42,13 +42,17 @@ public:
     // Load a checkpoint by ID. Restores via llama_state_seq_set_data_ext.
     // ctx_dft receives the MTP/draft context state if it was stored (may be nullptr).
     // out_spec_data receives the speculative impl state (pending_h etc.) if stored.
+    // dest_seq_id: sequence ID to restore KV cells under. Pass the CURRENT slot's
+    // seq_id here — it may differ from meta->slot_id on cross-slot cold-start restores.
+    // Defaults to UINT32_MAX which falls back to meta->slot_id (same-slot case).
     bool load(uint64_t checkpoint_id,
               struct llama_context* ctx,
               struct llama_context* ctx_dft,
               int32_t& out_pos_min,
               int32_t& out_pos_max,
               uint64_t& out_n_tokens,
-              std::vector<uint8_t>* out_spec_data = nullptr);
+              std::vector<uint8_t>* out_spec_data = nullptr,
+              uint32_t dest_seq_id = UINT32_MAX);
 
     // Find best matching checkpoint for a token sequence.
     // Searches within this conversation's cache only.
