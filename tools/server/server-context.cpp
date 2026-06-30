@@ -3479,6 +3479,8 @@ private:
                                                     ssd_lcp, (unsigned long)ssd_n_tokens);
                                             llama_memory_seq_rm_attn_only(
                                                 llama_get_memory(ctx_tgt), slot.id, ssd_lcp, -1);
+                                            // Attention state is only valid up to LCP for hybrid models
+                                            n_past = ssd_lcp;
                                         }
                                     }
 
@@ -3514,6 +3516,11 @@ private:
 
                                     // Flag that SSD cache restored this slot.
                                     slot.ssd_cold_start_used = true;
+                                    // For hybrid models with partial coverage, n_past was already set to ssd_lcp above.
+                                    // For full coverage (hybrid or dense), set n_past to n_push.
+                                    if (n_past == 0) {
+                                        n_past = n_push;
+                                    }
                                     } // ssd_n_tokens > 0 (not rejected by hybrid LCP check)
                                 }
                             }
