@@ -169,6 +169,9 @@ public:
     // Called once after llama_model is loaded.
     void set_model_info(const struct llama_model* model,
                         int cache_type_k, int cache_type_v);
+    // Configure SSD checkpoint writes: when true, skip fsync for lower write latency.
+    void set_no_fsync(bool no_fsync);
+
 
     // Max conversations: LRU eviction of entire conversation directories when exceeded.
     // Set before any store/find calls. Default: 16.

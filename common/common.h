@@ -635,6 +635,7 @@ struct common_params {
     int32_t prompt_cache_max = 8;           // max prompt buffer entries (deduplicated system prompts)
     int32_t cache_ssd_system_prompts = 8;   // max global system prompts to cache (0=disabled)
     int32_t cache_ssd_system_max_days = 30; // expire system prompts unused for N days (0=never)
+    bool cache_ssd_no_fsync = false;      // skip fsync on SSD checkpoint writes (trade durability for latency)
 
    std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

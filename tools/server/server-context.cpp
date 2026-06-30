@@ -1489,6 +1489,7 @@ private:
                 params_base.cache_ssd_path.c_str(), &cfg,
                 (size_t)n_ctx, params_base.cache_ssd_max_checkpoints);
             ssd_page_manager->max_conversations = params_base.cache_ssd_max_conversations;
+            ssd_page_manager->set_no_fsync(params_base.cache_ssd_no_fsync);
 
             // Set model info after page manager exists
             ssd_page_manager->set_model_info(model_tgt,

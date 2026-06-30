@@ -34,6 +34,7 @@ struct kv_ssd_config {
     bool auto_size           = true;
     int max_cold_checkpoints = 32;  // Max checkpoints per model (ring buffer cap)
     float memory_reserve     = 0.15f;
+    bool no_fsync            = false; // Skip fsync on write (faster, may lose last checkpoint on crash)
 };
 
 // Checkpoint metadata (in-memory index entry)
