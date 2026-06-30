@@ -1677,6 +1677,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_SSD_PAGE_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-ssd-no-fsync"},
+        string_format("skip fsync on SSD checkpoint writes (default: %s)", params.cache_ssd_no_fsync ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.cache_ssd_no_fsync = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

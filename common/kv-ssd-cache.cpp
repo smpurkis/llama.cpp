@@ -178,7 +178,9 @@ static bool write_index_file(kv_ssd_cache* c) {
         return false;
     }
     bool ok = pwrite_all(fd, &hdr, sizeof(hdr), 0);
-    fsync(fd);
+    if (!c->config.no_fsync) {
+        fsync(fd);
+    }
     close(fd);
     return ok;
 }
@@ -674,7 +676,9 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
         LOG_WRN("SSD cache: failed to write spec data: %s\n", strerror(errno));
         ok = false;
     }
-    fsync(fd);
+    if (!cache->config.no_fsync) {
+        fsync(fd);
+    }
     close(fd);
 
     if (!ok) {

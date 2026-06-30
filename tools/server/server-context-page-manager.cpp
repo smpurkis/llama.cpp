@@ -60,6 +60,10 @@ server_context_page_manager::server_context_page_manager(
     config_ = ssd_cfg;
 }
 
+void server_context_page_manager::set_no_fsync(bool no_fsync) {
+    config_.no_fsync = no_fsync;
+}
+
 server_context_page_manager::~server_context_page_manager() {
     // Each unique_ptr in conv_caches_ handles its own kv_ssd_free
 }
