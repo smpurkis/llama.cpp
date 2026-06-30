@@ -2642,6 +2642,17 @@ private:
             return;
         }
 
+        // MIN_USEFUL_SYS_TOKENS: don't cache trivial system sections
+        // (chat template header with no actual system message). The
+        // per-conversation SSD cache handles these cases. This also
+        // prevents false-positive boundary detection from filling
+        // the system cache with near-empty entries.
+        const int32_t MIN_USEFUL_SYS_TOKENS = 16;
+        if (n_sys < MIN_USEFUL_SYS_TOKENS) {
+            slot_sys_hash[slot.id] = 1;
+            return;
+        }
+
         // Get the state at the system prompt boundary
         size_t state_size = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         if (state_size == 0) {
@@ -3527,7 +3538,10 @@ private:
                         }
 
                         // cold start: try SSD system prompt cache restore (global, cross-conversation)
-                        if (n_past == 0 && sys_cache && ssd_page_manager) {
+                        // Only cold starts (empty slot) need system prompt cache.
+                        // Warm slots (n_tokens > 0) already have full context from
+                        // the in-memory prompt cache LCP restore or previous turn.
+                        if (n_past == 0 && slot.prompt.n_tokens() == 0 && sys_cache && ssd_page_manager) {
                             const auto & task_tokens = slot.task->tokens.get_tokens();
                             int n_sys = kv_detect_system_prompt_boundary(
                                 llama_model_get_vocab(llama_get_model(ctx_tgt)),
@@ -3548,8 +3562,13 @@ private:
                                 if (sys_cache->load((const uint32_t*)task_tokens.data(),
                                                     (uint32_t)n_sys, sys_data)) {
                                     // Restore system prompt state from cache
+                                    // Match the save flag (PARTIAL_ONLY) used by
+                                    // maybe_extract_system_prompt(). The system prompt
+                                    // cache only stores recurrent memory state, not
+                                    // attention KV cache. Loading with NONE would try
+                                    // to read attention data that isn't there.
                                     if (llama_state_seq_set_data_ext(ctx_tgt, sys_data.data(),
-                                            sys_data.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) > 0) {
+                                            sys_data.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) > 0) {
                                         n_past = n_sys;
 
                                         // Populate slot.prompt.tokens so get_common_prefix()
