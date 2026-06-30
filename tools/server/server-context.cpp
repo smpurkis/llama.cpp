@@ -1478,6 +1478,53 @@ private:
                     params_base.cache_ssd_warm_ram_mib);
         }
 
+        // Initialize global system prompt cache (cross-conversation reuse)
+        if (params_base.cache_ssd_system_prompts > 0 && !params_base.cache_ssd_path.empty()) {
+            // Compute model compat_hash (same FNV-1a as set_model_info)
+            char desc_buf[2048];
+            int desc_len = llama_model_desc(model_tgt, desc_buf, sizeof(desc_buf));
+            uint64_t compat_h = (desc_len > 0) ? 14695981039346656037ULL : 0;
+            if (desc_len > 0) {
+                for (int i = 0; i < desc_len; i++) {
+                    compat_h ^= (uint64_t)(unsigned char)desc_buf[i];
+                    compat_h *= 1099511628211ULL;
+                }
+                uint32_t tk = (uint32_t)params_base.cache_type_k;
+                compat_h ^= (uint64_t)(tk & 0xFF);         compat_h *= 1099511628211ULL;
+                compat_h ^= (uint64_t)((tk >> 8) & 0xFF);  compat_h *= 1099511628211ULL;
+                compat_h ^= (uint64_t)((tk >> 16) & 0xFF); compat_h *= 1099511628211ULL;
+                compat_h ^= (uint64_t)((tk >> 24) & 0xFF); compat_h *= 1099511628211ULL;
+                uint32_t tv = (uint32_t)params_base.cache_type_v;
+                compat_h ^= (uint64_t)(tv & 0xFF);         compat_h *= 1099511628211ULL;
+                compat_h ^= (uint64_t)((tv >> 8) & 0xFF);  compat_h *= 1099511628211ULL;
+                compat_h ^= (uint64_t)((tv >> 16) & 0xFF); compat_h *= 1099511628211ULL;
+                compat_h ^= (uint64_t)((tv >> 24) & 0xFF); compat_h *= 1099511628211ULL;
+            }
+
+            static auto hex64 = [](uint64_t h) {
+                char buf[17];
+                std::snprintf(buf, sizeof(buf), "%016lx", (unsigned long)h);
+                return std::string(buf);
+            };
+
+            std::string sys_dir = params_base.cache_ssd_path
+                + "/sys-" + hex64(compat_h);
+
+            sys_cache = std::make_unique<kv_ssd_system_cache>();
+            sys_cache->max_entries = (size_t)params_base.cache_ssd_system_prompts;
+            sys_cache->max_unused_days = params_base.cache_ssd_system_max_days;
+
+            if (sys_cache->init(sys_dir, compat_h)) {
+                SRV_INF("system prompt cache enabled: max_entries=%d, max_days=%d, path=%s\n",
+                        params_base.cache_ssd_system_prompts,
+                        params_base.cache_ssd_system_max_days,
+                        sys_dir.c_str());
+            } else {
+                SRV_WRN("%s\n", "system prompt cache init failed, disabling");
+                sys_cache.reset();
+            }
+        }
+
         if (!params_base.model_alias.empty()) {
             // backward compat: use first alias as model name
             model_name = *params_base.model_alias.begin();
