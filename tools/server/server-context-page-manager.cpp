@@ -12,9 +12,9 @@
 #include <cstring>
 #include <cstdio>
 #include <chrono>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <dirent.h>
+#include <filesystem>
+#include <system_error>
+namespace fs = std::filesystem;
 
 namespace llama {
 
@@ -37,7 +37,7 @@ server_context_page_manager::server_context_page_manager(
 ) : max_cross_slot_checkpoints_(max_cross_slot_checkpoints)
 {
     ssd_base_path_ = ssd_path;
-    mkdir(ssd_path, 0755);
+    fs::create_directories(ssd_path);
 
     kv_ssd_config ssd_cfg;
     if (cfg) {
@@ -121,15 +121,18 @@ server_ssd_cache* server_context_page_manager::get_or_create_cache(uint64_t conv
         time_t oldest_mtime = 0;
 
         for (const auto& [cv, cache] : conv_caches_) {
-            std::string dir = ssd_base_path_ + "/";
             char hex[17];
             snprintf(hex, sizeof(hex), "%016lx", (unsigned long)cv);
-            dir += hex;
+            fs::path dir = fs::path(ssd_base_path_) / hex;
 
-            struct stat st;
-            if (stat(dir.c_str(), &st) == 0) {
-                if (oldest_conv == 0 || st.st_mtime < oldest_mtime) {
-                    oldest_mtime = st.st_mtime;
+            std::error_code ec;
+            auto ftime = fs::last_write_time(dir, ec);
+            if (!ec) {
+                auto mtime = std::chrono::system_clock::to_time_t(
+                    std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                        ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()));
+                if (oldest_conv == 0 || mtime < oldest_mtime) {
+                    oldest_mtime = mtime;
                     oldest_conv = cv;
                 }
             }
@@ -140,22 +143,14 @@ server_ssd_cache* server_context_page_manager::get_or_create_cache(uint64_t conv
                      (unsigned long)oldest_conv, max_conversations);
 
             // Delete conversation directory and all its files
-            std::string dir = ssd_base_path_ + "/";
             char hex[17];
             snprintf(hex, sizeof(hex), "%016lx", (unsigned long)oldest_conv);
-            dir += hex;
+            fs::path dir = fs::path(ssd_base_path_) / hex;
 
-            DIR* d = opendir(dir.c_str());
-            if (d) {
-                struct dirent* ent;
-                while ((ent = readdir(d)) != nullptr) {
-                    if (ent->d_name[0] == '.') continue;
-                    std::string file = dir + "/" + ent->d_name;
-                    unlink(file.c_str());
-                }
-                closedir(d);
+            for (const auto& entry : fs::directory_iterator(dir)) {
+                fs::remove(entry.path());
             }
-            rmdir(dir.c_str());
+            fs::remove(dir);
 
             conv_wrappers_.erase(oldest_conv);
             conv_caches_.erase(oldest_conv);
@@ -637,12 +632,16 @@ server_ssd_cache* server_context_page_manager::get_or_create_user_cache(const st
         for (const auto& [uk, cache] : user_caches_) {
             char hex[17];
             snprintf(hex, sizeof(hex), "%016lx", (unsigned long)uk);
-            std::string dir = ssd_base_path_ + "/u/" + hex;
+            fs::path dir = fs::path(ssd_base_path_) / "u" / hex;
 
-            struct stat st;
-            if (stat(dir.c_str(), &st) == 0) {
-                if (oldest == 0 || st.st_mtime < oldest_mtime) {
-                    oldest_mtime = st.st_mtime;
+            std::error_code ec;
+            auto ftime = fs::last_write_time(dir, ec);
+            if (!ec) {
+                auto mtime = std::chrono::system_clock::to_time_t(
+                    std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                        ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()));
+                if (oldest == 0 || mtime < oldest_mtime) {
+                    oldest_mtime = mtime;
                     oldest = uk;
                 }
             }
@@ -654,19 +653,12 @@ server_ssd_cache* server_context_page_manager::get_or_create_user_cache(const st
 
             char hex[17];
             snprintf(hex, sizeof(hex), "%016lx", (unsigned long)oldest);
-            std::string dir = ssd_base_path_ + "/u/" + hex;
+            fs::path dir = fs::path(ssd_base_path_) / "u" / hex;
 
-            DIR* d = opendir(dir.c_str());
-            if (d) {
-                struct dirent* ent;
-                while ((ent = readdir(d)) != nullptr) {
-                    if (ent->d_name[0] == '.') continue;
-                    std::string file = dir + "/" + ent->d_name;
-                    unlink(file.c_str());
-                }
-                closedir(d);
+            for (const auto& entry : fs::directory_iterator(dir)) {
+                fs::remove(entry.path());
             }
-            rmdir(dir.c_str());
+            fs::remove(dir);
 
             user_wrappers_.erase(oldest);
             user_caches_.erase(oldest);
