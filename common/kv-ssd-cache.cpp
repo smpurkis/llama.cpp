@@ -8,6 +8,7 @@
 
 #include "log.h"
 
+#include <cstdio>
 #include <cstring>
 #include <cinttypes>
 #include <algorithm>

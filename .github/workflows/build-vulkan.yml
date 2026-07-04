@@ -73,116 +73,16 @@ jobs:
         run: |
           time cmake --build build -j $(nproc)
 
-  windows-x64:
-    runs-on: windows-2025
-
-    env:
-      VULKAN_VERSION: 1.4.313.2
-
-    permissions:
-      actions: write
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
-        with:
-          key: vulkan-windows-2025-x64
-          variant: ccache
-          evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-
-      - name: Install Vulkan SDK
-        id: get_vulkan
-        run: |
-          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
-          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
-          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
-          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
-
-      - name: Install Ninja
-        id: install_ninja
-        run: |
-          choco install ninja
-
-      - name: Build
-        id: cmake_build
-        run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_VULKAN=ON -DLLAMA_BUILD_BORINGSSL=ON
-          cmake --build build --config Release -j ${env:NUMBER_OF_PROCESSORS}
-
-      - name: Test
-        id: cmake_test
-        run: |
-          cd build
-          ctest -L main -C Release --verbose --timeout 900
-
       - name: Pack artifacts
         id: pack_artifacts
         run: |
-          7z a -snl llama-bin-win-vulkan-x64.zip .\build\bin\Release\*
+          7z a -snl llama-bin-linux-arm64-vulkan.zip ./build/bin/*
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
-          path: llama-bin-win-vulkan-x64.zip
-          name: llama-bin-win-vulkan-x64.zip
-
-  windows-msvc-x64:
-    runs-on: windows-2025
-
-    env:
-      VULKAN_VERSION: 1.4.313.2
-
-    permissions:
-      actions: write
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
-        with:
-          key: msvc-windows-2025-x64
-          variant: ccache
-          evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-
-      - name: Install Vulkan SDK
-        id: get_vulkan
-        run: |
-          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
-          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
-          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
-          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
-
-      - name: Build
-        id: cmake_build
-        run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_VULKAN=ON -DLLAMA_BUILD_BORINGSSL=ON
-          cmake --build build --config Release -j ${env:NUMBER_OF_PROCESSORS}
-
-      - name: Test
-        id: cmake_test
-        run: |
-          cd build
-          ctest -L main -C Release --verbose --timeout 900
-
-      - name: Pack artifacts
-        id: pack_artifacts
-        run: |
-          7z a -snl llama-bin-win-msvc-x64.zip .\build\bin\Release\*
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v6
-        with:
-          path: llama-bin-win-msvc-x64.zip
-          name: llama-bin-win-msvc-x64.zip
+          path: llama-bin-linux-arm64-vulkan.zip
+          name: llama-bin-linux-arm64-vulkan.zip
 
   ubuntu-llvmpipe:
     runs-on: ubuntu-24.04
@@ -243,3 +143,141 @@ jobs:
           # This is using llvmpipe and runs slower than other backends
           # test-backend-ops is too slow on llvmpipe, skip it
           ctest -L main -E test-backend-ops --verbose --timeout 900
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          7z a -snl llama-bin-linux-x64-vulkan.zip ./build/bin/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-linux-x64-vulkan.zip
+          name: llama-bin-linux-x64-vulkan.zip
+
+  windows-x64:
+    runs-on: windows-2025
+
+    env:
+      VULKAN_VERSION: 1.4.313.2
+
+    permissions:
+      actions: write
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: vulkan-windows-2025-x64-llvm
+          variant: ccache
+          evict-old-files: 1d
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+
+      - name: Install Vulkan SDK
+        id: get_vulkan
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Install Ninja
+        id: install_ninja
+        run: |
+          choco install ninja
+
+      - name: Build
+        id: cmake_build
+        run: |
+          cmake -S . -B build -G "Ninja Multi-Config" `
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_NATIVE=OFF `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DGGML_RPC=ON `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_VULKAN=ON `
+            -DLLAMA_BUILD_BORINGSSL=ON
+          cmake --build build --config Release -j ${env:NUMBER_OF_PROCESSORS}
+
+      - name: Test
+        id: cmake_test
+        run: |
+          cd build
+          ctest -L main -C Release --verbose --timeout 900
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          7z a -snl llama-bin-win-llvm-vulkan-x64.zip .\build\bin\Release\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-llvm-vulkan-x64.zip
+          name: llama-bin-win-llvm-vulkan-x64.zip
+
+  windows-msvc-x64:
+    runs-on: windows-2025
+
+    env:
+      VULKAN_VERSION: 1.4.313.2
+
+    permissions:
+      actions: write
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: msvc-windows-2025-x64-vulkan
+          variant: ccache
+          evict-old-files: 1d
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+
+      - name: Install Vulkan SDK
+        id: get_vulkan
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Build
+        id: cmake_build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_NATIVE=OFF `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DGGML_RPC=ON `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_VULKAN=ON `
+            -DLLAMA_BUILD_BORINGSSL=ON
+          cmake --build build --config Release -j ${env:NUMBER_OF_PROCESSORS}
+
+      - name: Test
+        id: cmake_test
+        run: |
+          cd build
+          ctest -L main -C Release --verbose --timeout 900
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          7z a -snl llama-bin-win-msvc-vulkan-x64.zip .\build\bin\Release\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-msvc-vulkan-x64.zip
+          name: llama-bin-win-msvc-vulkan-x64.zip
