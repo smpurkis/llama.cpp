@@ -6,6 +6,7 @@
 
 #include "kv-ssd-system-cache.h"
 #include "kv-ssd-cache.h"  // for kv_ssd_hash_tokens
+#include "kv-ssd-posix.h"
 #include "log.h"
 #include "llama.h"        // for llama_vocab / token attrs
 
@@ -16,11 +17,8 @@
 #include <cstdio>
 #include <cctype>
 #include <ctime>
-#include <dirent.h>
+#include <filesystem>
 #include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 namespace {
 
@@ -106,53 +104,48 @@ bool kv_ssd_system_cache::init(const std::string& model_dir, uint64_t compat_has
     compat_hash_ = compat_hash;
 
     // Ensure directory exists
-    struct stat st;
-    if (stat(model_dir_.c_str(), &st) != 0) {
-        if (mkdir(model_dir_.c_str(), 0755) != 0 && errno != EEXIST) {
+    namespace fs = std::filesystem;
+    fs::path model_path(model_dir_);
+    if (!fs::exists(model_path)) {
+        std::error_code ec;
+        if (!fs::create_directory(model_path, ec) && ec.value() != 0) {
             LOG_ERR("system cache: failed to create %s: %s\n",
-                    model_dir_.c_str(), std::strerror(errno));
+                    model_dir_.c_str(), ec.message().c_str());
             return false;
         }
     }
 
-    // Scan for existing sys-*.bin files
-    DIR* dir = opendir(model_dir_.c_str());
-    if (!dir) {
-        LOG_WRN("system cache: failed to open %s\n", model_dir_.c_str());
-        // Continue with empty cache - directory just got created.
-        initialized = true;
-        return true;
+    if (!fs::is_directory(model_path)) {
+        LOG_ERR("system cache: %s is not a directory\n", model_dir_.c_str());
+        return false;
     }
 
     size_t loaded = 0;
     size_t rejected = 0;
-    struct dirent* ent;
-    while ((ent = readdir(dir)) != nullptr) {
-        // Match sys-<16hex>.bin
-        const char* name = ent->d_name;
-        if (strncmp(name, "sys-", 4) != 0) continue;
-        size_t dlen = strlen(name);
-        if (dlen < 9 || strcmp(name + dlen - 4, ".bin") != 0) continue;
+    for (const auto& entry : fs::directory_iterator(model_path)) {
+        std::string fname = entry.path().filename().string();
+        if (fname.size() < 9) continue;
+        if (fname.compare(0, 4, "sys-") != 0) continue;
+        if (fname.compare(fname.size() - 4, 4, ".bin") != 0) continue;
 
-        std::string filepath = model_dir_ + "/" + name;
-        kv_ssd_system_entry entry;
-        if (load_entry_from_disk(filepath, entry)) {
-            if (compat_hash != 0 && entry.compat_hash != 0 && entry.compat_hash != compat_hash) {
+        std::string filepath = entry.path().string();
+        kv_ssd_system_entry sys_entry;
+        if (load_entry_from_disk(filepath, sys_entry)) {
+            if (compat_hash != 0 && sys_entry.compat_hash != 0 && sys_entry.compat_hash != compat_hash) {
                 LOG_WRN("system cache: rejecting %s (compat_hash mismatch: stored=%016lx current=%016lx)\n",
-                        name,
-                        (unsigned long)entry.compat_hash,
+                        fname.c_str(),
+                        (unsigned long)sys_entry.compat_hash,
                         (unsigned long)compat_hash);
                 rejected++;
                 continue;
             }
-            bytes_ += entry.data.size();
-            entries_[entry.hash] = std::move(entry);
+            bytes_ += sys_entry.data.size();
+            entries_[sys_entry.hash] = std::move(sys_entry);
             loaded++;
         } else {
             LOG_WRN("system cache: failed to load %s\n", filepath.c_str());
         }
     }
-    closedir(dir);
 
     initialized = true;
 
