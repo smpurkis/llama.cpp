@@ -1,16 +1,31 @@
 name: CI (CUDA, windows)
 
-# TODO: this workflow is only triggered manually because it is very heavy on the CI
-#       when we provision dedicated windows runners, we can enable it for pushes too
-# note: running this workflow manually will populate the ccache for the release builds
-#       this can be used before merging a PR to speed up the release workflow
 on:
   workflow_dispatch: # allows manual triggering
+  push:
+    branches:
+      - master
+    paths: [
+      '.github/workflows/build-cuda-windows.yml',
+      '**/CMakeLists.txt',
+      '**/.cmake',
+      '**/*.h',
+      '**/*.hpp',
+      '**/*.c',
+      '**/*.cpp',
+    ]
 
-# note: this will run in queue with the release workflow
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths: [
+      '.github/workflows/build-cuda-windows.yml',
+      'ggml/src/ggml-cuda/**'
+    ]
+
+# note: runs on every PR and push independently (no throttling behind release pipeline)
 concurrency:
-  group: release
-  queue: max
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
 
 env:
   GH_TOKEN: ${{ github.token }}
@@ -69,6 +84,17 @@ jobs:
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS% -t ggml
           cmake --build build --config Release
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          7z a -snl llama-bin-win-msvc-cuda-${{ matrix.cuda }}-x64.zip .\build\bin\Release\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-msvc-cuda-${{ matrix.cuda }}-x64.zip
+          name: llama-bin-win-msvc-cuda-${{ matrix.cuda }}-x64.zip
 
       - name: ccache-clear
         uses: ./.github/actions/ccache-clear
@@ -154,6 +180,17 @@ jobs:
             -DGPU_TARGETS="gfx1100"  `
             -DGGML_RPC=ON
           cmake --build build -j ${env:NUMBER_OF_PROCESSORS}
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          7z a -snl llama-bin-win-msvc-hip-x64.zip .\build\bin\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-msvc-hip-x64.zip
+          name: llama-bin-win-msvc-hip-x64.zip
 
       - name: ccache-clear
         uses: ./.github/actions/ccache-clear

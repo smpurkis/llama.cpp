@@ -37,7 +37,8 @@ server_context_page_manager::server_context_page_manager(
 ) : max_cross_slot_checkpoints_(max_cross_slot_checkpoints)
 {
     ssd_base_path_ = ssd_path;
-    fs::create_directories(ssd_path);
+    std::error_code ec_fs;
+    fs::create_directories(ssd_path, ec_fs);
 
     kv_ssd_config ssd_cfg;
     if (cfg) {
