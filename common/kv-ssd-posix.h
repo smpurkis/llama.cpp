@@ -18,13 +18,6 @@
 #include <sys/types.h>
 #include <cerrno>
 #include <cstdio>
-#include <cstring>
-
-// Last Windows error code for diagnostic logging.
-// thread_local: each thread tracks its own error to avoid races when
-// multiple threads call portable_pwrite/portable_pread concurrently.
-static thread_local DWORD g_last_win32_err = 0;
-static inline DWORD portable_get_last_win32_error(void) { return g_last_win32_err; }
 
 #include <BaseTsd.h>
 typedef SSIZE_T ssize_t;
@@ -66,61 +59,17 @@ static inline int portable_fsync(int fd) {
 }
 #define fsync portable_fsync
 
-// Note: offset is int64_t, not off_t — MSVC's off_t is 32-bit (long) and
-// wraps negative past 2 GiB, which SetFilePointerEx rejects (ERROR_NEGATIVE_SEEK).
-static inline ssize_t portable_pwrite(int fd, const void * buf, size_t count, int64_t offset) {
-    HANDLE h = (HANDLE)_get_osfhandle(fd);
-    if (h == INVALID_HANDLE_VALUE) { errno = EBADF; return -1; }
-    LARGE_INTEGER li;
-    li.QuadPart = offset;
-    if (!SetFilePointerEx(h, li, NULL, FILE_BEGIN)) {
-        g_last_win32_err = GetLastError();
-        switch (g_last_win32_err) {
-            default: errno = EIO; break;
-        }
-        return -1;
-    }
-    DWORD n = 0;
-    DWORD wc = (count > (size_t)UINT32_MAX) ? UINT32_MAX : (DWORD)count;
-    if (!WriteFile(h, buf, wc, &n, NULL)) {
-        DWORD err = GetLastError();
-        g_last_win32_err = err;
-        switch (err) {
-            case ERROR_HANDLE_DISK_FULL: case ERROR_DISK_FULL: errno = ENOSPC; break;
-            case ERROR_ACCESS_DENIED:    errno = EACCES; break;
-            default:                     errno = EIO; break;
-        }
-        return -1;
-    }
-    return (ssize_t)n;
+static inline ssize_t portable_pwrite(int fd, const void * buf, size_t count, off_t offset) {
+    if (_lseek(fd, offset, SEEK_SET) == -1) return -1;
+    int n = _write(fd, buf, (unsigned int)count);
+    return (n < 0) ? (ssize_t)-1 : (ssize_t)n;
 }
 #define pwrite portable_pwrite
 
-static inline ssize_t portable_pread(int fd, void * buf, size_t count, int64_t offset) {
-    HANDLE h = (HANDLE)_get_osfhandle(fd);
-    if (h == INVALID_HANDLE_VALUE) { errno = EBADF; return -1; }
-    LARGE_INTEGER li;
-    li.QuadPart = offset;
-    if (!SetFilePointerEx(h, li, NULL, FILE_BEGIN)) {
-        g_last_win32_err = GetLastError();
-        switch (g_last_win32_err) {
-            default: errno = EIO; break;
-        }
-        return -1;
-    }
-    DWORD n = 0;
-    DWORD rc = (count > (size_t)UINT32_MAX) ? UINT32_MAX : (DWORD)count;
-    if (!ReadFile(h, buf, rc, &n, NULL)) {
-        DWORD err = GetLastError();
-        g_last_win32_err = err;
-        if (err == ERROR_HANDLE_EOF) { errno = EIO; return -1; }
-        switch (err) {
-            case ERROR_ACCESS_DENIED: errno = EACCES; break;
-            default:                  errno = EIO; break;
-        }
-        return -1;
-    }
-    return (ssize_t)n;
+static inline ssize_t portable_pread(int fd, void * buf, size_t count, off_t offset) {
+    if (_lseek(fd, offset, SEEK_SET) == -1) return -1;
+    int n = _read(fd, buf, (unsigned int)count);
+    return (n < 0) ? (ssize_t)-1 : (ssize_t)n;
 }
 #define pread portable_pread
 
@@ -128,21 +77,8 @@ static inline ssize_t portable_pread(int fd, void * buf, size_t count, int64_t o
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
-
-// No-op on non-Windows
-static inline unsigned long portable_get_last_win32_error(void) { return 0; }
 #include <sys/types.h>
 #include <cerrno>
-#endif
-
-// Conditionally include Win32 error code in log messages (Windows only).
-// On POSIX these expand to nothing, eliminating "win32_err=0" noise.
-#ifdef _WIN32
-#define SSD_WIN32_ERR_FMT ", win32_err=%lu"
-#define SSD_WIN32_ERR_ARG , (unsigned long)portable_get_last_win32_error()
-#else
-#define SSD_WIN32_ERR_FMT ""
-#define SSD_WIN32_ERR_ARG
 #endif
 
 #endif

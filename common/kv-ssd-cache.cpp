@@ -4,18 +4,16 @@
 // Per-checkpoint file storage with ring buffer eviction.
 
 #include "kv-ssd-cache.h"
+#include "kv-ssd-posix.h"
 
 #include "log.h"
 
 #include <cstring>
 #include <cinttypes>
 #include <algorithm>
+#include <cerrno>
+#include <filesystem>
 #include <fcntl.h>
-#include <unistd.h>
-#include <dirent.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <errno.h>
 
 #ifdef __linux__
 #include <sys/sysinfo.h>
@@ -241,25 +239,24 @@ static bool load_checkpoint_file(kv_ssd_cache* c, const std::string& filepath) {
 
 // Scan the model directory for ckpt-*.bin files and load their headers.
 static size_t scan_checkpoint_files(kv_ssd_cache* c) {
-    DIR* dir = opendir(c->model_dir.c_str());
-    if (!dir) return 0;
+    namespace fs = std::filesystem;
+    fs::path dir(c->model_dir);
+    if (!fs::exists(dir) || !fs::is_directory(dir)) return 0;
 
     size_t loaded = 0;
-    struct dirent* ent;
-    while ((ent = readdir(dir)) != nullptr) {
-        // Match ckpt-*.bin
-        if (strncmp(ent->d_name, "ckpt-", 5) != 0) continue;
-        size_t dlen = strlen(ent->d_name);
-        if (dlen < 5 || strcmp(ent->d_name + dlen - 4, ".bin") != 0) continue;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        std::string fname = entry.path().filename().string();
+        if (fname.size() < 9) continue;
+        if (fname.compare(0, 5, "ckpt-") != 0) continue;
+        if (fname.compare(fname.size() - 4, 4, ".bin") != 0) continue;
 
-        std::string filepath = c->model_dir + "/" + ent->d_name;
+        std::string filepath = (dir / fname).string();
         if (load_checkpoint_file(c, filepath)) {
             loaded++;
         } else {
             LOG_WRN("SSD cache: warning: failed to load %s\n", filepath.c_str());
         }
     }
-    closedir(dir);
     return loaded;
 }
 
@@ -1026,24 +1023,23 @@ uint64_t kv_ssd_find_continuation(
 
     if (out_overlap) *out_overlap = 0.0f;
 
-    DIR* base_dir = opendir(base_path);
-    if (!base_dir) return 0;
+    namespace fs = std::filesystem;
+    fs::path base(base_path);
+    if (!fs::exists(base) || !fs::is_directory(base)) return 0;
 
     uint64_t best_conv = 0;
     float best_score = 0.0f;
 
-    struct dirent* ent;
-    while ((ent = readdir(base_dir)) != nullptr) {
-        if (ent->d_name[0] == '.') continue;
+    for (const auto& entry : fs::directory_iterator(base)) {
+        if (!entry.is_directory()) continue;
+        std::string dirname = entry.path().filename().string();
+        if (dirname[0] == '.') continue;
 
-        // Each subdirectory is a conv_hash (16 hex chars)
-        std::string conv_dir = std::string(base_path) + "/" + ent->d_name;
-        struct stat st;
-        if (stat(conv_dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        std::string conv_dir = entry.path().string();
 
         // Parse conv_hash from directory name
         uint64_t conv_hash = 0;
-        if (sscanf(ent->d_name, "%016lx", &conv_hash) != 1) continue;
+        if (sscanf(dirname.c_str(), "%016" SCNx64, &conv_hash) != 1) continue;
 
         // Load the index file for this conversation
         std::string index_file = conv_dir + "/index.bin";
@@ -1059,18 +1055,15 @@ uint64_t kv_ssd_find_continuation(
         if (compat_hash != 0 && hdr.compat_hash != 0 && hdr.compat_hash != compat_hash) continue;
 
         // Scan for checkpoint with best prefix overlap
-        DIR* conv_fd = opendir(conv_dir.c_str());
-        if (!conv_fd) continue;
-
         float best_conv_score = 0.0f;
 
-        struct dirent* ckpt_ent;
-        while ((ckpt_ent = readdir(conv_fd)) != nullptr) {
-            if (strncmp(ckpt_ent->d_name, "ckpt-", 5) != 0) continue;
-            size_t dlen = strlen(ckpt_ent->d_name);
-            if (dlen < 5 || strcmp(ckpt_ent->d_name + dlen - 4, ".bin") != 0) continue;
+        for (const auto& ckpt_entry : fs::directory_iterator(conv_dir)) {
+            std::string fname = ckpt_entry.path().filename().string();
+            if (fname.size() < 9) continue;
+            if (fname.compare(0, 5, "ckpt-") != 0) continue;
+            if (fname.compare(fname.size() - 4, 4, ".bin") != 0) continue;
 
-            std::string ckpt_file = conv_dir + "/" + ckpt_ent->d_name;
+            std::string ckpt_file = ckpt_entry.path().string();
             int cfd = open(ckpt_file.c_str(), O_RDONLY);
             if (cfd < 0) continue;
 
@@ -1100,14 +1093,12 @@ uint64_t kv_ssd_find_continuation(
                 : 0.0f;
             if (score > best_conv_score) best_conv_score = score;
         }
-        closedir(conv_fd);
 
         if (best_conv_score >= min_overlap && best_conv_score > best_score) {
             best_score = best_conv_score;
             best_conv = conv_hash;
         }
     }
-    closedir(base_dir);
 
     if (best_conv != 0) {
         LOG_INF("SSD cache: continuation found conv=%016lx overlap=%.1f%%\n",
@@ -1122,22 +1113,22 @@ uint64_t kv_ssd_find_continuation(
 uint32_t kv_ssd_get_max_turn_id_global(const char* base_path) {
     if (!base_path) return 0;
 
-    DIR* base_dir = opendir(base_path);
-    if (!base_dir) return 0;
+    namespace fs = std::filesystem;
+    fs::path base(base_path);
+    if (!fs::exists(base) || !fs::is_directory(base)) return 0;
 
     uint32_t max_turn = 0;
 
-    struct dirent* ent;
-    while ((ent = readdir(base_dir)) != nullptr) {
-        if (ent->d_name[0] == '.') continue;
+    for (const auto& entry : fs::directory_iterator(base)) {
+        if (!entry.is_directory()) continue;
+        std::string dirname = entry.path().filename().string();
+        if (dirname[0] == '.') continue;
 
-        std::string conv_dir = std::string(base_path) + "/" + ent->d_name;
-        struct stat st;
-        if (stat(conv_dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+        std::string conv_dir = entry.path().string();
 
         // Parse conv_hash (validate 16-char hex name)
         uint64_t conv_hash_test = 0;
-        if (sscanf(ent->d_name, "%016lx", &conv_hash_test) != 1) continue;
+        if (sscanf(dirname.c_str(), "%016" SCNx64, &conv_hash_test) != 1) continue;
 
         std::string index_file = conv_dir + "/index.bin";
         int fd = open(index_file.c_str(), O_RDONLY);
@@ -1149,16 +1140,13 @@ uint32_t kv_ssd_get_max_turn_id_global(const char* base_path) {
         if (!ok || hdr.magic != KV_SSD_MAGIC_INDEX) continue;
 
         // Quick scan of checkpoint files for max turn_created
-        DIR* conv_fd = opendir(conv_dir.c_str());
-        if (!conv_fd) continue;
+        for (const auto& ckpt_entry : fs::directory_iterator(conv_dir)) {
+            std::string fname = ckpt_entry.path().filename().string();
+            if (fname.size() < 9) continue;
+            if (fname.compare(0, 5, "ckpt-") != 0) continue;
+            if (fname.compare(fname.size() - 4, 4, ".bin") != 0) continue;
 
-        struct dirent* ckpt_ent;
-        while ((ckpt_ent = readdir(conv_fd)) != nullptr) {
-            if (strncmp(ckpt_ent->d_name, "ckpt-", 5) != 0) continue;
-            size_t dlen = strlen(ckpt_ent->d_name);
-            if (dlen < 5 || strcmp(ckpt_ent->d_name + dlen - 4, ".bin") != 0) continue;
-
-            std::string ckpt_file = conv_dir + "/" + ckpt_ent->d_name;
+            std::string ckpt_file = ckpt_entry.path().string();
             int cfd = open(ckpt_file.c_str(), O_RDONLY);
             if (cfd < 0) continue;
 
@@ -1169,9 +1157,7 @@ uint32_t kv_ssd_get_max_turn_id_global(const char* base_path) {
                 max_turn = rec.turn_created;
             }
         }
-        closedir(conv_fd);
     }
-    closedir(base_dir);
 
     return max_turn;
 }
