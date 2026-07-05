@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <climits>
 #include <cinttypes>
 #include <cstring>
 #include <cstdio>
@@ -24,14 +25,23 @@ namespace {
 
 // I/O helpers (duplicated minimally from kv-ssd-cache.cpp to keep
 // the system cache as a self-contained translation unit).
-bool pwrite_all(int fd, const void* buf, size_t count, off_t offset) {
+bool pwrite_all(int fd, const void* buf, size_t count, int64_t offset) {
+    static const size_t chunk_max = 64 * 1024 * 1024; // 64 MiB
     const char* ptr = (const char*)buf;
     size_t remaining = count;
-    off_t off = offset;
+    int64_t off = offset;
     while (remaining > 0) {
-        ssize_t n = pwrite(fd, ptr, remaining, off);
+        size_t chunk = remaining;
+        if (chunk > chunk_max) {
+            chunk = chunk_max;
+        }
+        ssize_t n = pwrite(fd, ptr, chunk, off);
         if (n < 0) {
             if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) {
+            errno = ENOSPC;
             return false;
         }
         ptr += n;
@@ -41,17 +51,22 @@ bool pwrite_all(int fd, const void* buf, size_t count, off_t offset) {
     return true;
 }
 
-bool pread_all(int fd, void* buf, size_t count, off_t offset) {
+bool pread_all(int fd, void* buf, size_t count, int64_t offset) {
+    static const size_t chunk_max = 64 * 1024 * 1024; // 64 MiB
     char* ptr = (char*)buf;
     size_t remaining = count;
-    off_t off = offset;
+    int64_t off = offset;
     while (remaining > 0) {
-        ssize_t n = pread(fd, ptr, remaining, off);
+        size_t chunk = remaining;
+        if (chunk > chunk_max) {
+            chunk = chunk_max;
+        }
+        ssize_t n = pread(fd, ptr, chunk, off);
         if (n < 0) {
             if (errno == EINTR) continue;
             return false;
         }
-        if (n == 0) return false;
+        if (n == 0) { errno = EIO; return false; }
         ptr += n;
         off += n;
         remaining -= (size_t)n;
@@ -219,8 +234,9 @@ bool kv_ssd_system_cache::store(const uint32_t* tokens, uint32_t n_tokens,
 
     // New entry - persist to disk first, then add to in-memory
     if (!write_entry_to_disk(entry)) {
-        LOG_ERR("system cache: failed to write %s: %s\n",
-                entry.filepath.c_str(), std::strerror(errno));
+        int se = errno;
+        LOG_ERR("system cache: failed to write %s: %s (errno=%d, win32_err=%lu)\n",
+                entry.filepath.c_str(), std::strerror(se), se, (unsigned long)portable_get_last_win32_error());
         return false;
     }
 
@@ -313,8 +329,9 @@ void kv_ssd_system_cache::evict_entry(uint64_t hash) {
 
     if (!it->second.filepath.empty()) {
         if (unlink(it->second.filepath.c_str()) != 0 && errno != ENOENT) {
-            LOG_WRN("system cache: failed to delete %s: %s\n",
-                    it->second.filepath.c_str(), std::strerror(errno));
+            int se = errno;
+            LOG_WRN("system cache: failed to delete %s: %s (errno=%d)\n",
+                    it->second.filepath.c_str(), std::strerror(se), se);
         }
     }
     entries_.erase(it);
@@ -405,7 +422,7 @@ bool kv_ssd_system_cache::load_entry_from_disk(const std::string& filepath, kv_s
     // Read data payload
     std::vector<uint8_t> data(rec.data_size);
     if (rec.data_size > 0) {
-        if (!pread_all(fd, data.data(), rec.data_size, (off_t)sizeof(kv_ssd_system_record))) {
+        if (!pread_all(fd, data.data(), rec.data_size, (int64_t)sizeof(kv_ssd_system_record))) {
             close(fd);
             return false;
         }
@@ -449,7 +466,7 @@ bool kv_ssd_system_cache::write_entry_to_disk(const kv_ssd_system_entry& entry) 
     bool ok = pwrite_all(fd, &rec, sizeof(rec), 0);
     if (ok && entry.data.size() > 0) {
         ok = pwrite_all(fd, entry.data.data(), entry.data.size(),
-                        (off_t)sizeof(kv_ssd_system_record));
+                        (int64_t)sizeof(kv_ssd_system_record));
     }
     fsync(fd);
     close(fd);

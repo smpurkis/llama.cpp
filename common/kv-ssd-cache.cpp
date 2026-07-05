@@ -8,11 +8,11 @@
 
 #include "log.h"
 
-#include <cstdio>
 #include <cstring>
 #include <cinttypes>
 #include <algorithm>
 #include <cerrno>
+#include <climits>
 #include <filesystem>
 #include <fcntl.h>
 
@@ -70,14 +70,28 @@ static size_t get_available_ram() {
 }
 
 // Write exactly `count` bytes to fd at offset.
-static bool pwrite_all(int fd, const void* buf, size_t count, off_t offset) {
+// Chunks at 64 MiB because Windows _write/_read return int (32-bit)
+// and cannot transfer >2 GiB in a single call. Also handles platforms
+// where ssize_t is 32-bit (MinGW) and large checkpoints (>=2 GiB).
+// Offsets are int64_t, not off_t: MSVC's off_t is 32-bit and wraps
+// negative once a checkpoint crosses 2 GiB.
+static bool pwrite_all(int fd, const void* buf, size_t count, int64_t offset) {
+    static const size_t chunk_max = 64 * 1024 * 1024; // 64 MiB
     const char* ptr = (const char*)buf;
     size_t remaining = count;
-    off_t off = offset;
+    int64_t off = offset;
     while (remaining > 0) {
-        ssize_t n = pwrite(fd, ptr, remaining, off);
+        size_t chunk = remaining;
+        if (chunk > chunk_max) {
+            chunk = chunk_max;
+        }
+        ssize_t n = pwrite(fd, ptr, chunk, off);
         if (n < 0) {
             if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) {
+            errno = ENOSPC;
             return false;
         }
         ptr += n;
@@ -88,17 +102,23 @@ static bool pwrite_all(int fd, const void* buf, size_t count, off_t offset) {
 }
 
 // Read exactly `count` bytes from fd at offset.
-static bool pread_all(int fd, void* buf, size_t count, off_t offset) {
+// Chunks at 64 MiB for the same reason as pwrite_all.
+static bool pread_all(int fd, void* buf, size_t count, int64_t offset) {
+    static const size_t chunk_max = 64 * 1024 * 1024; // 64 MiB
     char* ptr = (char*)buf;
     size_t remaining = count;
-    off_t off = offset;
+    int64_t off = offset;
     while (remaining > 0) {
-        ssize_t n = pread(fd, ptr, remaining, off);
+        size_t chunk = remaining;
+        if (chunk > chunk_max) {
+            chunk = chunk_max;
+        }
+        ssize_t n = pread(fd, ptr, chunk, off);
         if (n < 0) {
             if (errno == EINTR) continue;
             return false;
         }
-        if (n == 0) return false; // unexpected EOF
+        if (n == 0) { errno = EIO; return false; } // unexpected EOF
         ptr += n;
         off += n;
         remaining -= (size_t)n;
@@ -173,7 +193,8 @@ static bool write_index_file(kv_ssd_cache* c) {
     std::string path = index_path(c);
     int fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
-        LOG_WRN("SSD cache: failed to write index: %s\n", strerror(errno));
+        int se = errno;
+        LOG_WRN("SSD cache: failed to write index: %s (errno=%d, win32_err=%lu)\n", strerror(se), se, (unsigned long)portable_get_last_win32_error());
         return false;
     }
     bool ok = pwrite_all(fd, &hdr, sizeof(hdr), 0);
@@ -265,7 +286,8 @@ static size_t scan_checkpoint_files(kv_ssd_cache* c) {
 static bool delete_checkpoint_file(kv_ssd_cache* c, uint64_t id) {
     std::string path = ckpt_path(c, id);
     if (unlink(path.c_str()) != 0 && errno != ENOENT) {
-        LOG_WRN("SSD cache: failed to delete %s: %s\n", path.c_str(), strerror(errno));
+        int se = errno;
+        LOG_WRN("SSD cache: failed to delete %s: %s (errno=%d)\n", path.c_str(), strerror(se), se);
         return false;
     }
     return true;
@@ -485,7 +507,7 @@ static bool promote_to_hot(kv_ssd_cache* c, uint64_t id) {
 
     // Read all blobs concatenated: [tgt_data][dft_data][spec_data]
     std::vector<uint8_t> data(total_blob);
-    if (!pread_all(fd, data.data(), total_blob, (off_t)sizeof(kv_ssd_record))) {
+    if (!pread_all(fd, data.data(), total_blob, (int64_t)sizeof(kv_ssd_record))) {
         close(fd);
         return false;
     }
@@ -648,30 +670,42 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
     std::string filepath = ckpt_path(cache, id);
     int fd = open(filepath.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
-        LOG_WRN("SSD cache: failed to create %s: %s\n", filepath.c_str(), strerror(errno));
+        int se = errno;
+        LOG_WRN("SSD cache: failed to create %s: %s (errno=%d, win32_err=%lu, id=%lu, slot=%u)\n",
+                filepath.c_str(), strerror(se), se, (unsigned long)portable_get_last_win32_error(), (unsigned long)id, slot_id);
         cache->next_id--;
         return 0;
     }
 
     bool ok = true;
-    off_t off = 0;
+    int64_t off = 0;
     if (!pwrite_all(fd, &rec, sizeof(rec), off)) {
-        LOG_WRN("SSD cache: failed to write record header: %s\n", strerror(errno));
+        int se = errno;
+        LOG_WRN("SSD cache: failed to write record header: %s (errno=%d, win32_err=%lu, id=%lu, slot=%u)\n",
+                strerror(se), se, (unsigned long)portable_get_last_win32_error(), (unsigned long)id, slot_id);
         ok = false;
     }
-    off += (off_t)sizeof(kv_ssd_record);
+    off += (int64_t)sizeof(kv_ssd_record);
     if (ok && !pwrite_all(fd, data, data_size, off)) {
-        LOG_WRN("SSD cache: failed to write checkpoint data: %s\n", strerror(errno));
+        int se = errno;
+        LOG_WRN("SSD cache: failed to write checkpoint data: %s (errno=%d, win32_err=%lu, id=%lu, slot=%u, size=%zu, off=%jd)\n",
+                strerror(se), se, (unsigned long)portable_get_last_win32_error(), (unsigned long)id, slot_id, data_size, (intmax_t)off);
         ok = false;
     }
-    off += (off_t)data_size;
+    off += (int64_t)data_size;
     if (ok && rec.dft_data_size > 0 && !pwrite_all(fd, dft_data, rec.dft_data_size, off)) {
-        LOG_WRN("SSD cache: failed to write dft data: %s\n", strerror(errno));
+        int se = errno;
+        LOG_WRN("SSD cache: failed to write dft data: %s (errno=%d, win32_err=%lu, id=%lu, slot=%u, size=%llu, off=%jd)\n",
+                strerror(se), se, (unsigned long)portable_get_last_win32_error(), (unsigned long)id, slot_id,
+                (unsigned long long)rec.dft_data_size, (intmax_t)off);
         ok = false;
     }
-    off += (off_t)rec.dft_data_size;
+    off += (int64_t)rec.dft_data_size;
     if (ok && rec.spec_data_size > 0 && !pwrite_all(fd, spec_data, rec.spec_data_size, off)) {
-        LOG_WRN("SSD cache: failed to write spec data: %s\n", strerror(errno));
+        int se = errno;
+        LOG_WRN("SSD cache: failed to write spec data: %s (errno=%d, win32_err=%lu, id=%lu, slot=%u, size=%llu, off=%jd)\n",
+                strerror(se), se, (unsigned long)portable_get_last_win32_error(), (unsigned long)id, slot_id,
+                (unsigned long long)rec.spec_data_size, (intmax_t)off);
         ok = false;
     }
     if (!cache->config.no_fsync) {
