@@ -2672,8 +2672,9 @@ private:
         }
 
         if (done_pos_min < 0 || done_n_tokens < 64) return;
-        if (!slot.prompt.checkpoints.empty() &&
-            done_n_tokens <= slot.prompt.checkpoints.back().n_tokens + 64) return;
+        // Deferred checkpoint always captures final state. Skip the proximity
+        // guard used for mid-prompt checkpoints — the deferred ckpt is never
+        // "too close" to a prior ckpt; it's the most complete snapshot.
 
         while (slot.prompt.checkpoints.size() >= (size_t)params_base.n_ctx_checkpoints) {
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
