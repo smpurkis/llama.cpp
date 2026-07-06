@@ -194,7 +194,7 @@ static bool write_index_file(kv_ssd_cache* c) {
     int fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         int se = errno;
-        LOG_WRN("SSD cache: failed to write index: %s (errno=%d, win32_err=%lu)\n", strerror(se), se, (unsigned long)portable_get_last_win32_error());
+        LOG_WRN("SSD cache: failed to write index: %s (errno=%d" SSD_WIN32_ERR_FMT ")\n", strerror(se), se SSD_WIN32_ERR_ARG);
         return false;
     }
     bool ok = pwrite_all(fd, &hdr, sizeof(hdr), 0);
@@ -576,7 +576,7 @@ kv_ssd_cache* kv_ssd_init(const char* path, const kv_ssd_config* cfg, uint64_t c
     // appended to the hash hex so multiple identity schemes can coexist on
     // disk without colliding.
     char conv_hex[17];
-    snprintf(conv_hex, sizeof(conv_hex), "%016lx", (unsigned long)conv_hash);
+    snprintf(conv_hex, sizeof(conv_hex), "%016" PRIx64, conv_hash);
     c->base_path = std::string(path);
     c->model_dir = std::string(path) + "/" + namespace_prefix + conv_hex;
     if (namespace_prefix[0] != '\0') {
@@ -622,7 +622,7 @@ void kv_ssd_set_compat_hash(kv_ssd_cache* cache, uint64_t compat_hash) {
     if (!cache) return;
     std::lock_guard<std::mutex> lock(cache->mutex);
     cache->compat_hash = compat_hash;
-    LOG_INF("SSD cache: model compat_hash set to %016lx\n", (unsigned long)compat_hash);
+    LOG_INF("SSD cache: model compat_hash set to %016" PRIx64 "\n", compat_hash);
 }
 
 uint64_t kv_ssd_store(kv_ssd_cache* cache,
@@ -671,8 +671,8 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
     int fd = open(filepath.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         int se = errno;
-        LOG_WRN("SSD cache: failed to create %s: %s (errno=%d, win32_err=%lu, id=%lu, slot=%u)\n",
-                filepath.c_str(), strerror(se), se, (unsigned long)portable_get_last_win32_error(), (unsigned long)id, slot_id);
+        LOG_WRN("SSD cache: failed to create %s: %s (errno=%d" SSD_WIN32_ERR_FMT ", id=%lu, slot=%u)\n",
+                filepath.c_str(), strerror(se), se SSD_WIN32_ERR_ARG, (unsigned long)id, slot_id);
         cache->next_id--;
         return 0;
     }
@@ -681,30 +681,30 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
     int64_t off = 0;
     if (!pwrite_all(fd, &rec, sizeof(rec), off)) {
         int se = errno;
-        LOG_WRN("SSD cache: failed to write record header: %s (errno=%d, win32_err=%lu, id=%lu, slot=%u)\n",
-                strerror(se), se, (unsigned long)portable_get_last_win32_error(), (unsigned long)id, slot_id);
+        LOG_WRN("SSD cache: failed to write record header: %s (errno=%d" SSD_WIN32_ERR_FMT ", id=%lu, slot=%u)\n",
+                strerror(se), se SSD_WIN32_ERR_ARG, (unsigned long)id, slot_id);
         ok = false;
     }
     off += (int64_t)sizeof(kv_ssd_record);
     if (ok && !pwrite_all(fd, data, data_size, off)) {
         int se = errno;
-        LOG_WRN("SSD cache: failed to write checkpoint data: %s (errno=%d, win32_err=%lu, id=%lu, slot=%u, size=%zu, off=%jd)\n",
-                strerror(se), se, (unsigned long)portable_get_last_win32_error(), (unsigned long)id, slot_id, data_size, (intmax_t)off);
+        LOG_WRN("SSD cache: failed to write checkpoint data: %s (errno=%d" SSD_WIN32_ERR_FMT ", id=%lu, slot=%u, size=%zu, off=%jd)\n",
+                strerror(se), se SSD_WIN32_ERR_ARG, (unsigned long)id, slot_id, data_size, (intmax_t)off);
         ok = false;
     }
     off += (int64_t)data_size;
     if (ok && rec.dft_data_size > 0 && !pwrite_all(fd, dft_data, rec.dft_data_size, off)) {
         int se = errno;
-        LOG_WRN("SSD cache: failed to write dft data: %s (errno=%d, win32_err=%lu, id=%lu, slot=%u, size=%llu, off=%jd)\n",
-                strerror(se), se, (unsigned long)portable_get_last_win32_error(), (unsigned long)id, slot_id,
+        LOG_WRN("SSD cache: failed to write dft data: %s (errno=%d" SSD_WIN32_ERR_FMT ", id=%lu, slot=%u, size=%llu, off=%jd)\n",
+                strerror(se), se SSD_WIN32_ERR_ARG, (unsigned long)id, slot_id,
                 (unsigned long long)rec.dft_data_size, (intmax_t)off);
         ok = false;
     }
     off += (int64_t)rec.dft_data_size;
     if (ok && rec.spec_data_size > 0 && !pwrite_all(fd, spec_data, rec.spec_data_size, off)) {
         int se = errno;
-        LOG_WRN("SSD cache: failed to write spec data: %s (errno=%d, win32_err=%lu, id=%lu, slot=%u, size=%llu, off=%jd)\n",
-                strerror(se), se, (unsigned long)portable_get_last_win32_error(), (unsigned long)id, slot_id,
+        LOG_WRN("SSD cache: failed to write spec data: %s (errno=%d" SSD_WIN32_ERR_FMT ", id=%lu, slot=%u, size=%llu, off=%jd)\n",
+                strerror(se), se SSD_WIN32_ERR_ARG, (unsigned long)id, slot_id,
                 (unsigned long long)rec.spec_data_size, (intmax_t)off);
         ok = false;
     }
@@ -788,10 +788,10 @@ bool kv_ssd_load(kv_ssd_cache* cache, uint64_t checkpoint_id,
         auto ckpt_it = cache->index.find(checkpoint_id);
         if (ckpt_it != cache->index.end() && ckpt_it->second.compat_hash != cache->compat_hash) {
             LOG_WRN("SSD cache: rejecting checkpoint %lu - compat_hash mismatch "
-                    "(stored=%016lx current=%016lx)\n",
+                    "(stored=%016" PRIx64 " current=%016" PRIx64 ")\n",
                     (unsigned long)checkpoint_id,
-                    (unsigned long)ckpt_it->second.compat_hash,
-                    (unsigned long)cache->compat_hash);
+                    ckpt_it->second.compat_hash,
+                    cache->compat_hash);
             cache->stats_misses++;
             return false;
         }
@@ -909,9 +909,9 @@ uint64_t kv_ssd_find_match(kv_ssd_cache* cache,
     if (best_id != 0) {
         auto it = cache->index.find(best_id);
         uint64_t ntok = it != cache->index.end() ? (uint64_t)it->second.n_tokens : 0;
-        LOG_INF("SSD cache: match checkpoint %lu conv=%016lx"
+        LOG_INF("SSD cache: match checkpoint %lu conv=%016" PRIx64
                 " turn=%u n_tokens=%lu lcp=%d\n",
-                (unsigned long)best_id, (unsigned long)cache->conv_hash,
+                (unsigned long)best_id, cache->conv_hash,
                 best_turn, (unsigned long)ntok, best_lcp);
     }
     if (best_id != 0 && out_lcp) *out_lcp = best_lcp;
@@ -1136,8 +1136,8 @@ uint64_t kv_ssd_find_continuation(
     }
 
     if (best_conv != 0) {
-        LOG_INF("SSD cache: continuation found conv=%016lx overlap=%.1f%%\n",
-                (unsigned long)best_conv, best_score * 100.0f);
+        LOG_INF("SSD cache: continuation found conv=%016" PRIx64 " overlap=%.1f%%\n",
+                best_conv, best_score * 100.0f);
         if (out_overlap) *out_overlap = best_score;
     }
 

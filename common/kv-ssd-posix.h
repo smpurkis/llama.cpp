@@ -20,8 +20,10 @@
 #include <cstdio>
 #include <cstring>
 
-// Last Windows error code for diagnostic logging
-static DWORD g_last_win32_err = 0;
+// Last Windows error code for diagnostic logging.
+// thread_local: each thread tracks its own error to avoid races when
+// multiple threads call portable_pwrite/portable_pread concurrently.
+static thread_local DWORD g_last_win32_err = 0;
 static inline DWORD portable_get_last_win32_error(void) { return g_last_win32_err; }
 
 #include <BaseTsd.h>
@@ -131,6 +133,16 @@ static inline ssize_t portable_pread(int fd, void * buf, size_t count, int64_t o
 static inline unsigned long portable_get_last_win32_error(void) { return 0; }
 #include <sys/types.h>
 #include <cerrno>
+#endif
+
+// Conditionally include Win32 error code in log messages (Windows only).
+// On POSIX these expand to nothing, eliminating "win32_err=0" noise.
+#ifdef _WIN32
+#define SSD_WIN32_ERR_FMT ", win32_err=%lu"
+#define SSD_WIN32_ERR_ARG , (unsigned long)portable_get_last_win32_error()
+#else
+#define SSD_WIN32_ERR_FMT ""
+#define SSD_WIN32_ERR_ARG
 #endif
 
 #endif
