@@ -86,7 +86,7 @@ uint32_t aligned_size(uint32_t n) {
 // Print a 16-char hex hash for log messages
 std::string hex16(uint64_t h) {
     char buf[17];
-    std::snprintf(buf, sizeof(buf), "%016lx", (unsigned long)h);
+    std::snprintf(buf, sizeof(buf), "%016" PRIx64, h);
     return std::string(buf);
 }
 
@@ -147,10 +147,10 @@ bool kv_ssd_system_cache::init(const std::string& model_dir, uint64_t compat_has
         kv_ssd_system_entry sys_entry;
         if (load_entry_from_disk(filepath, sys_entry)) {
             if (compat_hash != 0 && sys_entry.compat_hash != 0 && sys_entry.compat_hash != compat_hash) {
-                LOG_WRN("system cache: rejecting %s (compat_hash mismatch: stored=%016lx current=%016lx)\n",
+                LOG_WRN("system cache: rejecting %s (compat_hash mismatch: stored=%016" PRIx64 " current=%016" PRIx64 ")\n",
                         fname.c_str(),
-                        (unsigned long)sys_entry.compat_hash,
-                        (unsigned long)compat_hash);
+                        sys_entry.compat_hash,
+                        compat_hash);
                 rejected++;
                 continue;
             }
@@ -235,8 +235,8 @@ bool kv_ssd_system_cache::store(const uint32_t* tokens, uint32_t n_tokens,
     // New entry - persist to disk first, then add to in-memory
     if (!write_entry_to_disk(entry)) {
         int se = errno;
-        LOG_ERR("system cache: failed to write %s: %s (errno=%d, win32_err=%lu)\n",
-                entry.filepath.c_str(), std::strerror(se), se, (unsigned long)portable_get_last_win32_error());
+        LOG_ERR("system cache: failed to write %s: %s (errno=%d" SSD_WIN32_ERR_FMT ")\n",
+                entry.filepath.c_str(), std::strerror(se), se SSD_WIN32_ERR_ARG);
         return false;
     }
 
