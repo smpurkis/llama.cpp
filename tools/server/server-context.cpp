@@ -2634,14 +2634,29 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        // Evict the least-useful checkpoint when at capacity.
+        //
+        // "Least useful" = the checkpoint with the highest pos_min. The do_reset
+        // search at prefill time uses `cur.pos_min < pos_min_thold` to find a
+        // checkpoint whose recurrent state covers the LCP-aligned position. For
+        // hybrid models with bounded recurrence (Gated DeltaNet / Mamba), pos_min
+        // is bounded by the rec window size, so checkpoints with recent pos_min
+        // never satisfy the constraint for early-LCP future turns.
+        //
+        // Evicting insertion-oldest (the previous behavior) loses mid-checkpoints
+        // from long turns first when short follow-up turns add deferred finals
+        // to the same ring. That leaves the slot with only recent deferred
+        // finals, all with high pos_min, forcing do_reset to fire on every
+        // future turn whose LCP predates the latest rec window.
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            auto worst = slot.prompt.checkpoints.begin();
+            for (auto it = std::next(worst); it != slot.prompt.checkpoints.end(); ++it) {
+                if (it->pos_min > worst->pos_min) worst = it;
+            }
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
-
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+                    worst->pos_min, worst->pos_max, worst->n_tokens, (float) worst->size() / 1024 / 1024);
+            slot.prompt.checkpoints.erase(worst);
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
@@ -2696,8 +2711,15 @@ private:
         // guard used for mid-prompt checkpoints — the deferred ckpt is never
         // "too close" to a prior ckpt; it's the most complete snapshot.
 
+        // Same eviction policy as create_checkpoint: prefer to keep
+        // low-pos_min checkpoints (useful for future early-LCP turns)
+        // and evict the highest-pos_min checkpoint when at capacity.
         while (slot.prompt.checkpoints.size() >= (size_t)params_base.n_ctx_checkpoints) {
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            auto worst = slot.prompt.checkpoints.begin();
+            for (auto it = std::next(worst); it != slot.prompt.checkpoints.end(); ++it) {
+                if (it->pos_min > worst->pos_min) worst = it;
+            }
+            slot.prompt.checkpoints.erase(worst);
         }
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
