@@ -542,7 +542,13 @@ bool server_context_page_manager::find_and_load_checkpoint(
     // with the state restoration setup in load().
     sc->prefetch(ckpt_id);
 
-    bool ok = sc->load(ckpt_id, ctx, ctx_dft, out_pos_min, out_pos_max, out_n_tokens, out_spec_data);
+    // Pass dest_seq_id (the slot currently processing the request) so KV cells
+    // are restored under seq_id == slot.id. Without this, server_ssd_cache::load
+    // falls back to meta->slot_id (the slot that originally stored the checkpoint),
+    // which differs on cold-start restarts when slots get reused. The KV cells would
+    // land under the wrong seq_id, leaving the destination slot's seq_id empty and
+    // tripping pos_min == -1 in pre_decode().
+    bool ok = sc->load(ckpt_id, ctx, ctx_dft, out_pos_min, out_pos_max, out_n_tokens, out_spec_data, dest_seq_id);
     if (ok) {
         cache_hits_++;
         if (out_lcp) *out_lcp = match_lcp;
