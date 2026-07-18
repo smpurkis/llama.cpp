@@ -1482,6 +1482,12 @@ private:
                 ? (size_t)params_base.cache_ssd_hot_ram_mib * 1024 * 1024 : 6ULL * 1024 * 1024;
             cfg.max_warm_bytes = params_base.cache_ssd_warm_ram_mib > 0
                 ? (size_t)params_base.cache_ssd_warm_ram_mib * 1024 * 1024 : 2ULL * 1024 * 1024;
+            // Explicit RAM caps are hard limits: disable auto-sizing so the per-conversation
+            // cache in common/kv-ssd-cache.cpp does not override these caps with values
+            // derived from sysinfo.freeram at conversation-create time. Both flags unset
+            // (default) keeps auto-sizing on so existing setups are unaffected.
+            cfg.auto_size = (params_base.cache_ssd_hot_ram_mib == 0 &&
+                             params_base.cache_ssd_warm_ram_mib == 0);
             cfg.hot_window_tokens = params_base.cache_ssd_hot_window_tokens;
             cfg.warm_window_tokens = params_base.cache_ssd_warm_window_tokens;
             cfg.page_size_tokens = params_base.cache_ssd_page_size_tokens;
