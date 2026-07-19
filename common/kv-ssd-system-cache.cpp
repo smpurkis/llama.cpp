@@ -311,6 +311,76 @@ bool kv_ssd_system_cache::load(const uint32_t* tokens, uint32_t n_tokens,
     return true;
 }
 
+const kv_ssd_system_entry* kv_ssd_system_cache::find_prefix_match(
+    const uint32_t* tokens, uint32_t n_query_tokens, uint32_t min_match)
+{
+    // Fallback for when boundary detection returns a slightly different n_sys
+    // than what was stored (e.g. the chat template inserts a few tokens
+    // between the system section and the first user message that vary
+    // between turns). The exact find() fails on n_tokens mismatch or hash
+    // mismatch, but the underlying system prompt is the same - we just need
+    // to find any stored entry whose first min(KV_SSD_SYS_TOKEN_MAX,
+    // n_query_tokens, entry.n_tokens) tokens match the query.
+    //
+    // Returns the entry whose prefix matches the query prefix for at
+    // least `min_match` tokens, or nullptr if none found.
+    if (!initialized || !tokens || n_query_tokens == 0 || min_match == 0) return nullptr;
+
+    const uint32_t verify_len = std::min({
+        (uint32_t)KV_SSD_SYS_TOKEN_MAX,
+        n_query_tokens,
+        (uint32_t)4096  // never scan more than 4k tokens per entry
+    });
+    if (verify_len < min_match) return nullptr;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // Use a non-const pointer for the bookkeeping writes (last_used/access_count)
+    // - the entries_ map values are mutable through the lock.
+    kv_ssd_system_entry* best = nullptr;
+    uint32_t best_match = 0;
+
+    for (auto & [hash, entry] : entries_) {
+        const uint32_t entry_prefix_len = std::min({
+            (uint32_t)entry.tokens.size(),
+            n_query_tokens,
+            verify_len
+        });
+        if (entry_prefix_len < min_match) continue;
+
+        uint32_t matched = 0;
+        for (uint32_t i = 0; i < entry_prefix_len; i++) {
+            if (entry.tokens[i] != tokens[i]) break;
+            matched++;
+        }
+
+        if (matched >= min_match && matched > best_match) {
+            best_match = matched;
+            best = &entry;
+        }
+    }
+
+    if (best) {
+        best->last_used = now_unix();
+        best->access_count++;
+        stats_hits++;
+        LOG_INF("system cache: prefix-match hit stored=%u query=%u matched=%u\n",
+                best->n_tokens, n_query_tokens, best_match);
+    } else {
+        stats_misses++;
+    }
+
+    return best;
+}
+
+bool kv_ssd_system_cache::load_prefix(const uint32_t* tokens, uint32_t n_query_tokens,
+                                      uint32_t min_match, std::vector<uint8_t>& out_data) {
+    const kv_ssd_system_entry* entry = find_prefix_match(tokens, n_query_tokens, min_match);
+    if (!entry) return false;
+    out_data = entry->data;
+    return true;
+}
+
 // =============================================================================
 // Eviction
 // =============================================================================

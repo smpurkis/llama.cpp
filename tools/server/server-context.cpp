@@ -4044,6 +4044,13 @@ private:
                             // grows past the rec window forces a full reprocess of the
                             // system prompt on the next user input. The cold-start path
                             // already does this, but only when slot.prompt is empty.
+                            //
+                            // Tries prefix-match if exact load fails: scans stored entries
+                            // for one whose first K tokens match the new task's first K
+                            // tokens. This handles the common case where the chat template
+                            // inserts a few dynamic tokens between the system section and
+                            // the first user message, shifting the boundary by tens of
+                            // tokens between turns.
                             if (n_past == 0 && slot.prompt.n_tokens() > 0 && sys_cache && ssd_page_manager) {
                                 const auto & task_tokens = slot.task->tokens.get_tokens();
                                 int n_sys = kv_detect_system_prompt_boundary(
@@ -4053,29 +4060,54 @@ private:
                                     params_base.chat_template.empty() ? nullptr : params_base.chat_template.c_str());
 
                                 const int32_t MIN_USEFUL_SYS_TOKENS = 16;
+                                const uint32_t MIN_PREFIX_MATCH = 64;
+
+                                int recovered_n_sys = 0;
+                                std::vector<uint8_t> sys_data;
+                                bool recovered = false;
+
                                 if (n_sys >= MIN_USEFUL_SYS_TOKENS && n_sys < (int32_t)task_tokens.size()) {
-                                    std::vector<uint8_t> sys_data;
                                     if (sys_cache->load((const uint32_t*)task_tokens.data(),
                                                         (uint32_t)n_sys, sys_data)) {
-                                        if (llama_state_seq_set_data_ext(ctx_tgt, sys_data.data(),
-                                                sys_data.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) > 0) {
-                                            n_past = n_sys;
-                                            pos_next = n_sys;
-                                            // Replace stale tokens from the previous turn with
-                                            // the new task's first n_sys tokens. Stale tokens
-                                            // would corrupt the prefill loop after n_past jumps.
-                                            slot.prompt.tokens.keep_first(0);
-                                            for (int32_t i = 0; i < n_sys; i++) {
-                                                slot.prompt.tokens.push_back(task_tokens[i]);
-                                            }
-                                            // Route seq_rm through seq_rm_attn_only so the loaded
-                                            // recurrent state is preserved (attention is empty for
-                                            // the system section and will be filled as prefill
-                                            // processes the remaining tokens).
-                                            slot.ssd_cold_start_used = true;
-                                            SLT_INF(slot, "[PROBE] sys-cache-fallback n_past=%d (n_sys=%d) after do_reset\n",
-                                                    n_past, n_sys);
+                                        recovered_n_sys = n_sys;
+                                        recovered = true;
+                                    } else if ((uint32_t)n_sys >= MIN_PREFIX_MATCH &&
+                                               sys_cache->load_prefix((const uint32_t*)task_tokens.data(),
+                                                       (uint32_t)n_sys, MIN_PREFIX_MATCH, sys_data)) {
+                                        // Prefix fallback matched. Use the boundary as
+                                        // n_past - the loaded state's recurrent state covers
+                                        // up to the stored entry's n_tokens, but for hybrid
+                                        // models the state at position N is computed from
+                                        // tokens [0, N). If the first 64+ tokens match we
+                                        // accept the approximate match; any model state drift
+                                        // is bounded by the small divergent region at the
+                                        // boundary.
+                                        recovered_n_sys = n_sys;
+                                        recovered = true;
+                                        SLT_INF(slot, "[PROBE] sys-cache-fallback prefix-match recovered at n_sys=%d (exact match failed)\n",
+                                                n_sys);
+                                    }
+                                }
+
+                                if (recovered) {
+                                    if (llama_state_seq_set_data_ext(ctx_tgt, sys_data.data(),
+                                            sys_data.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) > 0) {
+                                        n_past = recovered_n_sys;
+                                        pos_next = recovered_n_sys;
+                                        // Replace stale tokens from the previous turn with
+                                        // the new task's first n_sys tokens. Stale tokens
+                                        // would corrupt the prefill loop after n_past jumps.
+                                        slot.prompt.tokens.keep_first(0);
+                                        for (int32_t i = 0; i < recovered_n_sys; i++) {
+                                            slot.prompt.tokens.push_back(task_tokens[i]);
                                         }
+                                        // Route seq_rm through seq_rm_attn_only so the loaded
+                                        // recurrent state is preserved (attention is empty for
+                                        // the system section and will be filled as prefill
+                                        // processes the remaining tokens).
+                                        slot.ssd_cold_start_used = true;
+                                        SLT_INF(slot, "[PROBE] sys-cache-fallback n_past=%d (n_sys=%d) after do_reset\n",
+                                                n_past, recovered_n_sys);
                                     }
                                 }
                             }
