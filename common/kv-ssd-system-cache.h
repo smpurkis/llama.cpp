@@ -101,11 +101,26 @@ public:
     // Bumps last_used and access_count on hit.
     const kv_ssd_system_entry* find(const uint32_t* tokens, uint32_t n_tokens);
 
+    // Prefix-match fallback for when exact find() fails (e.g. boundary
+    // detection returns a slightly different n_sys than what was stored,
+    // because the chat template inserts a few dynamic tokens at the
+    // system/user boundary that differ between turns).
+    //
+    // Scans all stored entries and returns the one whose stored prefix
+    // matches the query prefix for at least `min_match` tokens. Verifies
+    // up to KV_SSD_SYS_TOKEN_MAX tokens per entry.
+    const kv_ssd_system_entry* find_prefix_match(
+        const uint32_t* tokens, uint32_t n_query_tokens, uint32_t min_match);
+
     // Load a system prompt's KV state into out_data.
     // Returns true on success. Caller is responsible for restoring the data
     // to the llama_context.
     bool load(const uint32_t* tokens, uint32_t n_tokens,
               std::vector<uint8_t>& out_data);
+
+    // Load via prefix-match fallback. Returns true on hit.
+    bool load_prefix(const uint32_t* tokens, uint32_t n_query_tokens,
+                     uint32_t min_match, std::vector<uint8_t>& out_data);
 
     // Force-evict entries that have not been used in N days.
     // Returns the number of entries evicted.
