@@ -3503,7 +3503,7 @@ struct vk_fa_tuning_params {
 };
 
 static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type);
-static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type = GGML_TYPE_F16, ggml_type v_type = GGML_TYPE_F16);
+static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type = GGML_TYPE_F16);
 
 static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
 
@@ -3659,7 +3659,7 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
         bool shape_ok = (f32acc && device->coopmat_support_16x16x16_f32acc) ||
                         (!f32acc && device->coopmat_support_16x16x16_f16acc);
         const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
-        bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, k_type, v_type);
+        bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, k_type);
 
         if (!shape_ok || !shmem_ok) {
             path = FA_SCALAR;
@@ -3669,6 +3669,11 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
     // scalar is faster than coopmat when N==1
     if (n_rows == 1 && (path == FA_COOPMAT1 || path == FA_COOPMAT2)) {
         path = FA_SCALAR;
+    }
+
+    // Q1_0 K/V is only implemented on coopmat2 (flash_attn_cm2); there is no scalar FA shader for it.
+    if ((k_type == GGML_TYPE_Q1_0 || v_type == GGML_TYPE_Q1_0) && device->coopmat2) {
+        path = FA_COOPMAT2;
     }
 
     switch (path) {
@@ -3912,27 +3917,16 @@ static uint32_t get_subgroup_size(const std::string &pipeline_name, const vk_dev
     return 0; // If no matching configuration is found
 }
 
-// Whether scalar flash attention will use the MMQ path for the given K/V types.
-static bool ggml_vk_fa_type_needs_shmem(ggml_type type) {
-    switch (type) {
-    case GGML_TYPE_IQ4_NL:
-        return true;
-    default:
-        return false;
-    }
-}
-
-static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type, ggml_type v_type) {
+// Whether scalar flash attention will use the MMQ path for the given k_type.
+static bool ggml_vk_fa_scalar_uses_mmq(const vk_device& device, ggml_type k_type) {
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
     return device->integer_dot_product && device->subgroup_clustered &&
-           !ggml_vk_fa_type_needs_shmem(v_type) &&
            (k_type == GGML_TYPE_Q4_0 || k_type == GGML_TYPE_Q4_1 ||
             k_type == GGML_TYPE_Q5_0 || k_type == GGML_TYPE_Q5_1 ||
             k_type == GGML_TYPE_Q8_0);
 #else
     GGML_UNUSED(device);
     GGML_UNUSED(k_type);
-    GGML_UNUSED(v_type);
     return false;
 #endif
 }
@@ -4265,7 +4259,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const bool fa_ds = fa.first.subgroup_size == 0;
 
         const bool bf16_kv = fa.first.k_type == GGML_TYPE_BF16;
-        const bool use_mmq = ggml_vk_fa_scalar_uses_mmq(device, fa.first.k_type, fa.first.v_type);
+        const bool use_mmq = ggml_vk_fa_scalar_uses_mmq(device, fa.first.k_type);
         const void * spv_data = nullptr;
         size_t spv_size = 0;
         const char *name = nullptr;
@@ -6222,11 +6216,6 @@ static vk_device ggml_vk_get_device(size_t idx) {
         // "radv/amdgpu: Not enough memory for command submission" followed by
         // vk::Queue::submit: ErrorDeviceLost. UMA devices (RDNA3 Phoenix, etc.)
         // default to 8 nodes per submit so each batch finishes well under 2s.
-        // CachyLLama RDNA3 (Phoenix1/Phoenix, gfx1103, e.g. 7840U) measurement on
-        // Qwen3.6-35B-A3B Q4_K_XL showed nps=100 completes without lockup and gives
-        // a reproducible +4.5% on tg64 over nps=8; nps=64 gets ~93% of that with
-        // less lockup risk and is what llama-run.sh exports on gfx1103. See
-        // RDNA3_NOTES.md. Users can override via GGML_VK_NODES_PER_SUBMIT.
         device->max_nodes_per_submit = device->uma ? 8 : 100;
         const char* GGML_VK_MAX_NODES_PER_SUBMIT = getenv("GGML_VK_MAX_NODES_PER_SUBMIT");
         const char* GGML_VK_NODES_PER_SUBMIT    = getenv("GGML_VK_NODES_PER_SUBMIT");
@@ -10435,6 +10424,7 @@ static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx
 
 static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type) {
     GGML_UNUSED(f32acc);
+    GGML_UNUSED(v_type);
     // Needs to be kept up to date on shader changes
     const uint32_t wg_size = params.workgroup_size;
     const uint32_t Br = params.block_rows;
@@ -10443,15 +10433,13 @@ static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, con
     // BF16 uses the fp32 shader (FLOAT_TYPE=float)
     const uint32_t float_type_size = (device->fp16 && k_type != GGML_TYPE_BF16) ? sizeof(ggml_fp16_t) : sizeof(float);
 
-    const bool mmq = ggml_vk_fa_scalar_uses_mmq(device, k_type, v_type);
+    const bool mmq = ggml_vk_fa_scalar_uses_mmq(device, k_type);
 
     // tmpsh is overestimated slightly
     const uint32_t tmpsh = wg_size * sizeof(float);
     const uint32_t tmpshv4 = wg_size * 4 * float_type_size;
 
     const uint32_t masksh = Bc * (Br + 1) * float_type_size;
-    // DATA_A_IQ4_NL is compiled into the FA shaders unconditionally, so its shared table is always allocated.
-    const uint32_t iq_shmem = 16 * float_type_size;
 
     uint32_t Qf, kvsh, kblocksh_size;
     if (mmq) {
@@ -10476,7 +10464,7 @@ static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, con
         kblocksh_size = 0;
     }
 
-    const uint32_t total_size = tmpsh + tmpshv4 + masksh + iq_shmem + Qf + kvsh + kblocksh_size;
+    const uint32_t total_size = tmpsh + tmpshv4 + masksh + Qf + kvsh + kblocksh_size;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
 
     VK_LOG_DEBUG("ggml_vk_flash_attn_scalar_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", mmq=" << mmq << ", total_size=" << total_size << ", supported=" << supported);
@@ -10484,8 +10472,7 @@ static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, con
     return supported;
 }
 
-static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type) {
-    GGML_UNUSED(v_type);
+static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type) {
     // Needs to be kept up to date on shader changes
     const uint32_t Br = params.block_rows;
     const uint32_t Bc = params.block_cols;
@@ -10501,8 +10488,6 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     const uint32_t f16vec4 = 8;
 
     const uint32_t tmpsh = (Bc / MatBc) * sizeof(float);
-    // DATA_A_IQ4_NL is compiled into the FA shaders unconditionally, so its shared table is always allocated.
-    const uint32_t iq_shmem = 16 * sizeof(ggml_fp16_t);
 
     const uint32_t qstride = hsk_pad / 4 + 2;
     const uint32_t Qf = Br * qstride * f16vec4;
@@ -10524,7 +10509,7 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
 
     const uint32_t slope = Br * acctype;
 
-    const uint32_t total_size = tmpsh + iq_shmem + Qf + Psh + sfsh + ksh + pvsh + slope;
+    const uint32_t total_size = tmpsh + Qf + Psh + sfsh + ksh + pvsh + slope;
     const bool supported = total_size <= device->properties.limits.maxComputeSharedMemorySize;
 
     VK_LOG_DEBUG("ggml_vk_flash_attn_coopmat_shmem_support(HSK=" << hsk << ", HSV=" << hsv << ", f32acc=" << f32acc << ", total_size=" << total_size << ", supported=" << supported);
@@ -10607,13 +10592,11 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     bool use_dequant_kv = !ctx->device->fa_no_scratch_transpose &&
                           k_quant && v_quant && N >= 64 &&
                           k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
-                          k->nb[1] >= k->nb[2] && v->nb[1] >= v->nb[2] &&
                           ggml_is_contiguously_allocated(k) && ggml_is_contiguously_allocated(v) &&
                           (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
                           (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
                           ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
-                          ctx->device->pipeline_dequant_transpose[v->type] != nullptr &&
-                          !ctx->device->coopmat2;
+                          ctx->device->pipeline_dequant_transpose[v->type] != nullptr;
     if (use_dequant_kv && !ctx->device->fa_scratch_force) {
         const uint64_t k_f16_sz = (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t);
         const uint64_t v_f16_sz = (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t);
@@ -17760,7 +17743,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->src[3] && op->src[3]->type != GGML_TYPE_F16) {
                     return false;
                 }
-                auto fa_kv_ok = [](ggml_type t) {
+                auto fa_kv_ok = [coopmat2](ggml_type t) {
                     switch (t) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
@@ -17770,8 +17753,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q4_0:
-                    case GGML_TYPE_IQ4_NL:
                         return true;
+                    case GGML_TYPE_Q1_0:
+                        return coopmat2;
                     default:
                         return false;
                     }
