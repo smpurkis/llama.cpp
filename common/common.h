@@ -626,6 +626,7 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_every_nt = -1;   // make a checkpoint every n tokens during prefill, -1 to disable
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+    bool    checkpoint_near_end = false; // create a checkpoint near the end of every prompt (upstream default: false)
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     std::string cache_ssd_path = "";       // path for SSD-backed KV cache (empty = disabled)
     int32_t cache_ssd_max_checkpoints = 64;  // max checkpoints to store on SSD per slot
