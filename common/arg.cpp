@@ -1515,6 +1515,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--checkpoint-near-end"},
+        {"--no-checkpoint-near-end"},
+        string_format("force a checkpoint within the last ubatch of every prompt, regardless of --checkpoint-min-step (default: %s)",
+            params.checkpoint_near_end ? "on" : "off"),
+        [](common_params & params, bool value) {
+            params.checkpoint_near_end = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cpent", "--checkpoint-every-n-tokens"}, "N",
         string_format("create a checkpoint every n tokens during prefill (processing), -1 to disable (default: %d)", params.checkpoint_every_nt),
         [](common_params & params, int value) {
