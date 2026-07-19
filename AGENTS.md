@@ -312,6 +312,20 @@ The server (`tools/server/`) is OpenAI-compatible. See `tools/server/README.md` 
 
 ---
 
+## CachyLLama-only patch sets
+
+CachyLLama diverges from `upstream/master` by tracking these third-party works. Re-evaluate when upstream merges or upstream PRs close.
+
+| Patch | Source | Upstream status | CachyLLama-specific additions |
+|-------|--------|-----------------|------------------------------|
+| Quantized-KV flash-attention prefill (Vulkan) | [Nathanw1014/llama.cpp#25494](https://github.com/ggml-org/llama.cpp/pull/25494) | PR open, under review by `jeffbolznv` | Host-RAM gate via `common::host_available_ram()`, three env vars (`GGML_VK_NO_FA_SCRATCH_TRANSPOSE`, `GGML_VK_FA_SCRATCH_SAFETY_MB`, `GGML_VK_FA_SCRATCH_FORCE`), printf-style warning logs. Files: `ggml/src/ggml-vulkan/ggml-vulkan.cpp`, `ggml/src/ggml-vulkan/vulkan-shaders/dequant_q8_0.comp`, `ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp`. |
+| Strix Halo RDNA3.5 tuning (ROCm/HIP) | gaetan-puleo via `perf(rocm): apply RDNA3.5 Strix Halo tuning` | Merged upstream | None. Drop the CachyLLama-only entry when the upstream tuning lands in master. |
+| `common::host_available_ram()` | Extracted from `common/kv-ssd-cache.cpp` and `common/kv_page_manager.cpp` (duplicate implementations) | None (CachyLLama-only refactor) | New files `common/host-ram.h` and `common/host-ram.cpp`. Both callers migrated. |
+
+When a CachyLLama-only patch lands upstream, delete the CachyLLama-specific rows from the diff and let the next `merge upstream/master` drop the patch naturally.
+
+---
+
 ## Quick Reference
 
 ```bash

@@ -30,6 +30,8 @@ We're not faster at inference. We don't support more models. We don't add new qu
 
 **APU/iGPU Vulkan tuning.** Automatic `nodes_per_submit` reduction for RDNA3 iGPUs (the default upstream value is tuned for discrete GPUs and starves the shader engine on shared-memory APUs). Manual override via `GGML_VK_NODES_PER_SUBMIT`.
 
+**Quantized-KV flash-attention prefill (Strix Halo / RDNA3.5).** Backports [ggml-org/llama.cpp#25494](https://github.com/ggml-org/llama.cpp/pull/25494) with a CachyLLama memory gate. The coopmat1 FA path re-dequantizes the quantized K/V cache inside every Q workgroup on every prefill step - fine on a discrete GPU with a big L2, brutal on shared-memory UMA. The fix dequantizes+transposes into a per-head-contiguous f16 scratch once per layer, then runs the coalesced f16 FA. On Strix Halo (gfx1151) Qwen3-Coder-30B-A3B q8_0 at 32k context: pp512 +41%, tg +129% vs stock. Three runtime controls: `GGML_VK_NO_FA_SCRATCH_TRANSPOSE=1` disables, `GGML_VK_FA_SCRATCH_SAFETY_MB=N` tunes the safety margin (default 1024 MiB), `GGML_VK_FA_SCRATCH_FORCE=1` bypasses the host-RAM check. The gate uses `common::host_available_ram()` so 32 GB boxes with long context automatically fall back to the slow path instead of OOMing.
+
 **CPU ISA auto-detection.** The upstream Vulkan build defaults to `GGML_NATIVE=OFF` and `GGML_AVX512=OFF`, leaving AVX-512 code paths compiled out on Zen 4 hardware that supports them (5-15% gen speedup on Vulkan, 30-100% on CPU-offloaded layers). CachyLLama's build wrapper reads `/proc/cpuinfo` and enables the right ISA level for the detected CPU.
 
 **Checkpoint matching for cross-conversation safety.** When a checkpoint's recurrent state was computed from a different conversation, restoring it produces garbage. CachyLLama's search layer classifies matches as same-conversation (recurrent state is content-accurate, accept any size) or cross-conversation (only restore checkpoints whose `n_tokens` fits within the common prefix). Overflow handling caps `n_past` to leave room for new token evaluation instead of resetting.
@@ -100,6 +102,16 @@ To identify a request, pass `llama_user_id` in the request body. OpenAI SDK call
 | Flag | Default | Description |
 |------|---------|-------------|
 | `GGML_VK_NODES_PER_SUBMIT` | auto | Override automatic `nodes_per_submit` (lower values feed RDNA3 iGPUs more frequently) |
+
+### Quantized-KV flash-attention scratch control (Strix Halo)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `GGML_VK_NO_FA_SCRATCH_TRANSPOSE` | (unset) | Set to `1` to disable the dequant+transpose scratch entirely. Use this if you see OOM on long-context prefills with quantized KV cache. |
+| `GGML_VK_FA_SCRATCH_SAFETY_MB` | 1024 | MiB of host-RAM headroom the scratch allocator requires before allocating. Higher = stricter. |
+| `GGML_VK_FA_SCRATCH_FORCE` | (unset) | Set to `1` to bypass the host-RAM check. The scratch will be allocated regardless. |
+
+The gate runs at every prefill step when K and V are both quantized (q8_0 or q4_0 today), N is at least 64 (prefill, not decode), and the tensors are contiguous. If `required_scratch + GGML_VK_FA_SCRATCH_SAFETY_MB > MemAvailable`, the slow coopmat1 path runs instead and a one-time warning is logged. The scratch size grows with context: ~256 MiB at 128k for head_dim 128 (Qwen3-Coder-30B-A3B), ~512 MiB at 128k for head_dim 256 (Qwen3.6-35B-A3B). Tracked upstream as [ggml-org/llama.cpp#25494](https://github.com/ggml-org/llama.cpp/pull/25494).
 
 ## MoE expert tracking API
 
