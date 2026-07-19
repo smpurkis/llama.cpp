@@ -112,6 +112,13 @@ if (Vulkan_FOUND)
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
     target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
+    # CachyLLama: FA quant-KV dequant-scratch gate calls common::host_available_ram().
+    # host-ram.cpp is in common/, but linking ggml-vulkan against llama-common creates a
+    # cyclic dep (llama-common already depends on ggml-vulkan). Compile the single TU
+    # directly into ggml-vulkan instead. The function is small and self-contained.
+    target_include_directories(ggml-vulkan PRIVATE ${CMAKE_SOURCE_DIR}/common)
+    target_sources(ggml-vulkan PRIVATE ${CMAKE_SOURCE_DIR}/common/host-ram.cpp)
+
     # Workaround to the "can't dereference invalidated vector iterator" bug in clang-cl debug build
     # Possibly relevant: https://stackoverflow.com/questions/74748276/visual-studio-no-displays-the-correct-length-of-stdvector
     if (MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")

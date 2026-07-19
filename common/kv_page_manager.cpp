@@ -15,15 +15,7 @@
 #include <errno.h>
 
 // Platform-specific memory detection
-#ifdef __linux__
-#include <sys/sysinfo.h>
-#endif
-#ifdef __APPLE__
-#include <sys/sysctl.h>
-#include <mach/mach.h>
-#include <mach/mach_host.h>
-#include <mach/host_info.h>
-#endif
+#include "host-ram.h"
 
 namespace llama {
 
@@ -47,7 +39,6 @@ static void queue_page_save(kv_page_manager* km, uint64_t page_id);
 static void wait_for_page_loaded(kv_page_manager* km, uint64_t page_id);
 static void io_thread_func(kv_page_manager* km);
 static uint64_t get_timestamp_ms();
-static size_t get_available_memory_bytes();
 static uint64_t calculate_eviction_score(kv_page_manager* km, const kv_page_entry& entry);
 
 // =============================================================================
@@ -400,7 +391,7 @@ void kv_page_manager_perf_stats(kv_page_manager* km,
 }
 
 void kv_page_manager_auto_size(kv_page_manager* km) {
-    size_t available = get_available_memory_bytes();
+    size_t available = common::host_available_ram();
     km->detected_memory_bytes = available;
     
     // Reserve some memory for system
@@ -807,40 +798,5 @@ static uint64_t get_timestamp_ms() {
     return static_cast<uint64_t>(ms);
 }
 
-static size_t get_available_memory_bytes() {
-#ifdef __linux__
-    struct sysinfo info;
-    if (sysinfo(&info) == 0) {
-        return info.freeram * info.mem_unit;
-    }
-    return 8ULL * 1024 * 1024 * 1024;
-#elif defined(__APPLE__)
-    // See common/kv-ssd-cache.cpp get_available_ram() for rationale: read
-    // hw.memsize for total then vm_statistics64 for free + inactive (the
-    // Apple-reclaimable page cache bucket) so auto-sizing reflects memory
-    // we can actually grow into.
-    int64_t total = 0;
-    size_t size = sizeof(total);
-    if (sysctlbyname("hw.memsize", &total, &size, NULL, 0) != 0 || total <= 0) {
-        return 8ULL * 1024 * 1024 * 1024;
-    }
-    mach_port_t host = mach_host_self();
-    vm_size_t page_size = 0;
-    if (host_page_size(host, &page_size) != KERN_SUCCESS || page_size == 0) {
-        return (size_t) total;
-    }
-    vm_statistics64_data_t vm_stats;
-    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-    kern_return_t kr = host_statistics64(
-        host, HOST_VM_INFO64, (host_info64_t) &vm_stats, &count);
-    if (kr != KERN_SUCCESS) {
-        return (size_t) total;
-    }
-    size_t free_pages = (size_t) vm_stats.free_count + (size_t) vm_stats.inactive_count;
-    return free_pages * (size_t) page_size;
-#else
-    return 8ULL * 1024 * 1024 * 1024;
-#endif
-}
 
 } // namespace llama
