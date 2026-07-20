@@ -172,6 +172,21 @@ jobs:
   #         amd-smi static
   #         GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS="gfx1101" bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
 
+  # Strix Halo (gfx1151) HIP smoke build. Verifies the rdna3_5 MMQ config compiles
+  # and runs a quick benchmark. Only fires on a self-hosted runner tagged STRIX-HALO.
+  amd-rocm-strix-halo:
+    runs-on: [self-hosted, Linux, AMD, STRIX-HALO]
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: Smoke build
+        id: ggml-ci
+        run: |
+          amd-smi static
+          GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS="gfx1151" bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
+
   gpu-metal:
     runs-on: [self-hosted, macOS, ARM64]
 
