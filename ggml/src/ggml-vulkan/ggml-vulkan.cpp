@@ -6222,6 +6222,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
         // "radv/amdgpu: Not enough memory for command submission" followed by
         // vk::Queue::submit: ErrorDeviceLost. UMA devices (RDNA3 Phoenix, etc.)
         // default to 8 nodes per submit so each batch finishes well under 2s.
+        // CachyLLama RDNA3 (Phoenix1/Phoenix, gfx1103, e.g. 7840U) measurement on
+        // Qwen3.6-35B-A3B Q4_K_XL showed nps=100 completes without lockup and gives
+        // a reproducible +4.5% on tg64 over nps=8; nps=64 gets ~93% of that with
+        // less lockup risk and is what llama-run.sh exports on gfx1103. See
+        // RDNA3_NOTES.md. Users can override via GGML_VK_NODES_PER_SUBMIT.
         device->max_nodes_per_submit = device->uma ? 8 : 100;
         const char* GGML_VK_MAX_NODES_PER_SUBMIT = getenv("GGML_VK_MAX_NODES_PER_SUBMIT");
         const char* GGML_VK_NODES_PER_SUBMIT    = getenv("GGML_VK_NODES_PER_SUBMIT");
