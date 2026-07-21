@@ -586,9 +586,9 @@ struct common_params {
     // to keep hot experts paged in while cold ones are evicted from RAM.
     // Reduces physical memory footprint of MoE models; relies on Linux mmap.
     bool   moe_expert_residency    = false;  // master enable
-    int32_t moe_resident_per_layer = 16;     // experts kept hot per layer
+    int32_t moe_resident_per_layer = 32;     // experts kept hot per layer
     bool   moe_residency_prewarm   = true;   // prewarm top-K experts at startup
-    int32_t moe_residency_top_k    = 8;      // prewarm K experts
+    int32_t moe_residency_top_k    = 16;     // prewarm K experts
     bool   moe_residency_log       = true;   // log hit rate every 16 decodes
 
     bool single_turn       = false; // single turn chat conversation
