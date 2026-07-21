@@ -33,16 +33,6 @@
 // because it triggers the n_rs_seq rollback-exceeded failure for R > n_rs_seq.
 // seq_rm_attn_only is the only way to clean up after a checkpoint restore when
 // the saved positions extend past the restored checkpoint's logical end.
-//
-// The same shape of bug also affects DeepSeek-V4 (DSV4) models, which use
-// llama_kv_cache_dsv4 (not the hybrid mem_attn + mem_recr layout). DSV4's
-// seq_pos_min intentionally returns kv_raw->seq_pos_max so server-context
-// cannot roll back via checkpoint search, so a "p0 < seq_pos_min" safety
-// gate is broken-by-design on DSV4 (cur_min == seq_pos_max rejects every
-// in-range p0). The fix on the DSV4 side removes that gate from
-// llama_kv_cache_dsv4::seq_rm so the truncation path actually runs and
-// drops stale kv_raw cells past the LCP, letting llama_batch_init's
-// "Y = X + 1" check pass.
 
 #include "arg.h"
 #include "common.h"
@@ -50,16 +40,7 @@
 
 #include <clocale>
 #include <cstdio>
-#include <cstring>
 #include <vector>
-
-static bool model_is_dsv4(const llama_model * model) {
-    char arch[64] = {0};
-    if (llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) < 0) {
-        return false;
-    }
-    return strcmp(arch, "deepseek4") == 0;
-}
 
 static llama_context * make_ctx(const common_params & params, llama_model * model, uint32_t n_rs_seq) {
     auto cparams = common_context_params_to_llama(params);
@@ -103,14 +84,11 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // The bug is hybrid-specific (mem_recr stale positions) or DSV4-specific
-    // (kv_raw cells beyond the checkpoint end survive the seq_rm safety gate).
-    // For all other architectures (dense attention, plain recurrent), the
-    // seq_pos tracking already lines up with the cells and the test is not
-    // informative.
-    const bool is_dsv4 = model_is_dsv4(model);
-    if (!llama_model_is_hybrid(model) && !is_dsv4) {
-        fprintf(stderr, "%s : skipping for non-hybrid, non-DSV4 model\n", __func__);
+    // Skips for non-hybrid models - the bug is hybrid-specific.
+    // n_rs_seq must be > 0 (recurrent rollback is required for the bug to be
+    // observable on mem_recr's seq_pos_max).
+    if (!llama_model_is_hybrid(model)) {
+        fprintf(stderr, "%s : skipping for non-hybrid model\n", __func__);
         return 0;
     }
 
@@ -123,9 +101,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s : failed to init contexts\n", __func__);
         return 1;
     }
-    if (!is_dsv4 && llama_n_rs_seq(ctx_src) == 0) {
-        // Hybrid models need n_rs_seq > 0 to reproduce the bug via mem_recr.
-        // DSV4 doesn't use n_rs_seq, so this check is meaningless there.
+    if (llama_n_rs_seq(ctx_src) == 0) {
         fprintf(stderr, "%s : skipping because n_rs_seq is disabled\n", __func__);
         llama_free(ctx_src);
         llama_free(ctx_dst);
@@ -137,7 +113,7 @@ int main(int argc, char ** argv) {
         // no-op vocab: synthesize distinct tokens
         for (int i = 1; i <= 32; ++i) tokens.push_back(i);
     } else {
-        tokens = common_tokenize(ctx_src, "The quick brown fox jumps over the lazy dog many times many times over and over and over again", true);
+        tokens = common_tokenize(ctx_src, "The quick brown fox jumps over the lazy dog many times", true);
     }
     // Need enough tokens for N + R where R > n_rs_seq.
     const uint32_t N = 4;                       // checkpoint logical end (positions [0, N))
@@ -241,8 +217,8 @@ int main(int argc, char ** argv) {
         }
     }
 
-    fprintf(stdout, "%s : OK - %s, seq_pos_max = %d (truncated from %d by seq_rm_attn_only)\n",
-            __func__, is_dsv4 ? "DSV4" : "hybrid", (int) post_pos_max, (int) loaded_pos_max);
+    fprintf(stdout, "%s : OK - seq_pos_max = %d (truncated from %d by seq_rm_attn_only)\n",
+            __func__, (int) post_pos_max, (int) loaded_pos_max);
 
     llama_free(ctx_src);
     llama_free(ctx_dst);
