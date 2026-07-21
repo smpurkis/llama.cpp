@@ -4164,10 +4164,13 @@ private:
                     slot.print_timings_pp();
 
                     // truncate any tokens that are beyond n_past for this slot.
-                    // skip when a checkpoint restored state (SSD cache or in-memory) —
-                    // the model positions after checkpoint restore may not match token
-                    // indices on hybrid models (MoE/SSM), and the restore already loaded
-                    // the correct recurrent state. full seq_rm would crash.
+                    // skip when a checkpoint restored state (SSD cache or in-memory).
+                    // a full common_context_seq_rm is unsafe on hybrid because it
+                    // routes through mem_recr->seq_rm, whose n_rs_seq rollback path
+                    // can fail when the saved checkpoint's position range extends
+                    // past n_past (e.g., previous turn's generation tokens beyond
+                    // LCP). the seq_rm_attn_only path handles both caches safely.
+                    // See: https://github.com/fewtarius/llama-ai/issues/8
                     if (!slot.ssd_cold_start_used) {
                         const llama_pos p0 = slot.prompt.tokens.pos_next();
 
@@ -4178,12 +4181,20 @@ private:
                             common_context_seq_rm(ctx_dft.get(), slot.id, p0, -1);
                         }
                     } else {
-                        // For SSD restored slots, only clear the attention cache.
-                        // The recurrent memory was loaded from the SSD checkpoint
-                        // and must be preserved — full seq_rm would fail on hybrid
-                        // models (n_rs_seq rollback exceeded) because the SSD
-                        // checkpoint's model positions may not align with token
-                        // indices (e.g., pos=[1242,1242] for 1239 tokens).
+                        // For SSD/in-memory restored slots on hybrid models:
+                        // clear attn cells AND stale position tracking in mem_recr.
+                        //
+                        // full common_context_seq_rm is unsafe on hybrid because
+                        // seq_rm's n_rs_seq rollback path can fail when rollback
+                        // exceeds n_rs_seq (mamba/GDN models). the seq_rm_attn_only
+                        // path calls mem_attn->seq_rm (regular, frees cells) AND
+                        // mem_recr->seq_rm_positions_only (clears seq_id without
+                        // touching data - no rollback path).
+                        //
+                        // both are required: without clearing mem_recr's stale
+                        // positions, hybrid seq_pos_max (min of attn+recr) would
+                        // still report the stale value, and llama_batch_init
+                        // validation fails on the next batch. See issue #8.
                         const llama_pos p0 = slot.prompt.tokens.pos_next();
                         SLT_DBG(slot, "SSD used, seq_rm_attn_only [%d, end)\n", p0);
                         auto * mem = llama_get_memory(ctx_tgt);
