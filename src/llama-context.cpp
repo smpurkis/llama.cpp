@@ -774,7 +774,15 @@ void llama_context::sched_reserve() {
     }
 }
 
+// Track MoE expert activations. Synchronize first to ensure the graph
+    // compute has actually completed before reading argsort tensor data,
+    // since track_expert_activations runs inside the per-ubatch loop and
+    // graph_compute_async is asynchronous.
 void llama_context::track_expert_activations(ggml_cgraph * gf, uint32_t /* n_tokens */) {
+    if (sched) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+
     if (!gf || !expert_tracking_enabled) return;
 
     const int64_t n_layer = model.hparams.n_layer();
