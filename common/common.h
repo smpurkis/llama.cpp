@@ -585,6 +585,16 @@ struct common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
+    // MoE expert SSD residency (Phase 1, madvise-based).
+    // When enabled, tracks which MoE experts fire per layer and uses madvise
+    // to keep hot experts paged in while cold ones are evicted from RAM.
+    // Reduces physical memory footprint of MoE models; relies on Linux mmap.
+    bool   moe_expert_residency    = false;  // master enable
+    int32_t moe_resident_per_layer = 16;     // experts kept hot per layer
+    bool   moe_residency_prewarm   = true;   // prewarm top-K experts at startup
+    int32_t moe_residency_top_k    = 8;      // prewarm K experts
+    bool   moe_residency_log       = true;   // log hit rate every 16 decodes
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K

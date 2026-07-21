@@ -2,7 +2,6 @@
 // Copyright (c) 2026 fewtarius
 
 #include "llama-moe-residency.h"
-#include "llama-moe-coact.h"
 
 #include "llama.h"
 #include "llama-model.h"
@@ -12,7 +11,6 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -27,45 +25,6 @@ static inline size_t page_align_down(size_t x) {
 
 static inline size_t page_align_up(size_t x) {
     return (x + size_t(getpagesize()) - 1) & ~(size_t(getpagesize()) - 1);
-}
-
-// Cache scoring helpers
-
-static inline double recency_score(uint64_t current_token, uint64_t last_access) {
-    if (current_token <= last_access) return 1.0;
-    const double dt = double(current_token - last_access);
-    return 1.0 / (1.0 + dt);
-}
-
-static inline double frequency_score(uint64_t current_token, uint64_t loaded_at,
-                                     uint64_t access_count) {
-    if (current_token <= loaded_at) return double(access_count);
-    const double age = double(current_token - loaded_at);
-    return double(access_count) / (1.0 + age);
-}
-
-// Combined recency+frequency score. Higher = keep longer.
-static inline double rf_score(uint64_t current_token,
-                              const llama_moe_layer_residency_internal::cache_entry & e) {
-    return 0.5 * recency_score(current_token, e.last_access) +
-           0.5 * frequency_score(current_token, e.loaded_at, e.access_count);
-}
-
-// Find the slot in `cache` with the lowest rf_score (most evictable).
-// Returns the slot index.
-static int find_evict_slot(const std::vector<llama_moe_layer_residency_internal::cache_entry> & cache,
-                           uint64_t current_token) {
-    int best = -1;
-    double best_score = 1e30;
-    for (size_t i = 0; i < cache.size(); ++i) {
-        if (!cache[i].occupied) return (int) i;
-        const double s = rf_score(current_token, cache[i]);
-        if (s < best_score) {
-            best_score = s;
-            best = (int) i;
-        }
-    }
-    return best;
 }
 
 // madvise a region. Aligns to page boundaries so the kernel can act on it.
@@ -149,11 +108,6 @@ bool llama_moe_residency_build(
         if (t_down) lr.down_stride    = t_down->nb[2];
         if (t_gu)   lr.gate_up_stride = t_gu->nb[2];
 
-        // Allocate per-layer R+F cache. Sized to max_resident_per_layer.
-        lr.cache.assign(cfg.max_resident_per_layer,
-                        llama_moe_layer_residency_internal::cache_entry{});
-        lr.slot_of.assign(n_expert, -1);
-
         out->layers.push_back(std::move(lr));
         layers_with_experts++;
     }
@@ -181,66 +135,40 @@ void llama_moe_residency_touch(
     if (expert_id < 0 || expert_id >= st->layers[layer_idx].n_expert) return;
 
     auto & lr = st->layers[layer_idx];
-    lr.token_counter++;
 
-    int slot = lr.slot_of[expert_id];
-    bool hit = (slot >= 0 && lr.cache[slot].occupied);
+    bool hit = lr.loaded_set.count(expert_id) > 0;
     if (was_already_loaded) *was_already_loaded = hit;
 
     if (hit) {
-        // Cache hit: update recency/frequency.
-        auto & e = lr.cache[slot];
-        e.last_access = lr.token_counter;
-        e.access_count++;
+        lr.lru.erase(std::remove(lr.lru.begin(), lr.lru.end(), expert_id), lr.lru.end());
+        lr.lru.push_back(expert_id);
         lr.hits++;
         st->total_hits++;
         return;
     }
 
-    // Cache miss: find an evict slot (lowest R+F score, or first empty).
-    const int evict_slot = find_evict_slot(lr.cache, lr.token_counter);
-    if (evict_slot < 0) return;  // shouldn't happen
-
-    // If the chosen slot is occupied, evict it first.
-    if (lr.cache[evict_slot].occupied) {
-        const int evicted_id = lr.cache[evict_slot].expert_id;
-        if (evicted_id >= 0 && evicted_id < (int) lr.slot_of.size()) {
-            lr.slot_of[evicted_id] = -1;
-            const size_t eoff = (size_t) evicted_id;
-            // MADV_FREE (not MADV_DONTNEED): the kernel can drop these
-            // pages if it needs the memory but is free to keep them
-            // resident otherwise. MADV_DONTNEED forced the kernel to
-            // evict immediately, which on memory-constrained systems
-            // (Flip: 8 GB OS-only RAM, 32 GB physical) turned every
-            // cold miss into a disk page-fault and dropped prompt eval
-            // from ~215 t/s to ~56 t/s on Qwen3.6-35B-A3B Q4_K_XL
-            // (3.8x regression, root-caused 2026-07-27). With
-            // MADV_FREE the kernel LRU + memory pressure decide
-            // eviction; pages stay hot while memory is available.
-            for_each_tensor(lr, [&](void * base, size_t stride) {
-                safe_madvise((uint8_t *) base + eoff * stride, stride, MADV_FREE);
-            });
-            st->total_evicted++;
-        }
-    }
-
-    // Install the new entry.
-    auto & e = lr.cache[evict_slot];
-    e.expert_id    = expert_id;
-    e.last_access  = lr.token_counter;
-    e.access_count = 1;
-    e.loaded_at    = lr.token_counter;
-    e.occupied     = true;
-    lr.slot_of[expert_id] = evict_slot;
+    lr.loaded_set.insert(expert_id);
+    lr.lru.push_back(expert_id);
     lr.misses++;
     st->total_misses++;
     st->total_touched++;
 
-    // Mark pages as WILLNEED for all present tensors.
     const size_t off = (size_t) expert_id;
     for_each_tensor(lr, [&](void * base, size_t stride) {
         safe_madvise((uint8_t *) base + off * stride, stride, MADV_WILLNEED);
     });
+
+    while (lr.lru.size() > st->cfg.max_resident_per_layer) {
+        int evict = lr.lru.front();
+        lr.lru.pop_front();
+        lr.loaded_set.erase(evict);
+
+        const size_t eoff = (size_t) evict;
+        for_each_tensor(lr, [&](void * base, size_t stride) {
+            safe_madvise((uint8_t *) base + eoff * stride, stride, MADV_DONTNEED);
+        });
+        st->total_evicted++;
+    }
 }
 
 void llama_moe_residency_touch_layer_selection(
@@ -277,7 +205,6 @@ void llama_moe_residency_prewarm(
 
     for (size_t il = 0; il < st->layers.size(); ++il) {
         const int * layer_top = top_experts ? top_experts[il] : nullptr;
-        auto & lr = st->layers[il];
         for (int k = 0; k < K; ++k) {
             int expert_id;
             if (layer_top) {
@@ -286,23 +213,11 @@ void llama_moe_residency_prewarm(
                 expert_id = k;
             }
             if (expert_id < 0) continue;
-            if (expert_id >= lr.n_expert) continue;
-            if (lr.slot_of[expert_id] >= 0) continue;  // already loaded
-
-            // Install in next free slot (no eviction during prewarm).
-            int slot = -1;
-            for (size_t s = 0; s < lr.cache.size(); ++s) {
-                if (!lr.cache[s].occupied) { slot = (int) s; break; }
-            }
-            if (slot < 0) continue;  // cache full
-            lr.token_counter++;
-            auto & e = lr.cache[slot];
-            e.expert_id    = expert_id;
-            e.last_access  = lr.token_counter;
-            e.access_count = 0;
-            e.loaded_at    = lr.token_counter;
-            e.occupied     = true;
-            lr.slot_of[expert_id] = slot;
+            if (expert_id >= st->layers[il].n_expert) continue;
+            auto & lr = st->layers[il];
+            if (lr.loaded_set.count(expert_id) > 0) continue;
+            lr.loaded_set.insert(expert_id);
+            lr.lru.push_back(expert_id);
             st->total_touched++;
 
             const size_t off = (size_t) expert_id;
@@ -321,15 +236,14 @@ void llama_moe_residency_release(
         struct llama_moe_residency_state * st) {
     if (!st) return;
     for (auto & lr : st->layers) {
-        for (auto & e : lr.cache) {
-            if (!e.occupied) continue;
-            const size_t off = (size_t) e.expert_id;
+        for (int expert_id : lr.lru) {
+            const size_t off = (size_t) expert_id;
             for_each_tensor(lr, [&](void * base, size_t stride) {
                 safe_madvise((uint8_t *) base + off * stride, stride, MADV_DONTNEED);
             });
-            e.occupied = false;
         }
-        for (auto & s : lr.slot_of) s = -1;
+        lr.loaded_set.clear();
+        lr.lru.clear();
     }
     st->layers.clear();
 }
@@ -345,7 +259,7 @@ void llama_moe_residency_log_stats(
     const uint64_t total = st->total_hits + st->total_misses;
     const double hit_rate = total > 0 ? double(st->total_hits) / double(total) : 0.0;
 
-    LLAMA_LOG_DEBUG(
+    LLAMA_LOG_INFO(
         "moe-residency: decodes=%llu touches=%llu hits=%llu misses=%llu evictions=%llu hit_rate=%.1f%%\n",
         (unsigned long long) st->decode_count,
         (unsigned long long) st->total_touched,
