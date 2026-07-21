@@ -1655,6 +1655,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_SSD_MAX_CONVERSATIONS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-ssd-cold-maxsize"}, "N",
+        string_format("global cap on total cold tier size across all conversations in MiB (default: %lld, 0=unlimited)",
+            (long long)params.cache_ssd_cold_max_size_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value for --cache-ssd-cold-maxsize: must be >= 0");
+            }
+            params.cache_ssd_cold_max_size_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SSD_COLD_MAXSIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--prompt-max"}, "N",
         string_format("max system prompt cache entries (default: %d, 0=disabled)", params.prompt_cache_max),
         [](common_params & params, int value) {
