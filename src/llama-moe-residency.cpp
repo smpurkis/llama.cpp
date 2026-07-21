@@ -259,7 +259,7 @@ void llama_moe_residency_log_stats(
     const uint64_t total = st->total_hits + st->total_misses;
     const double hit_rate = total > 0 ? double(st->total_hits) / double(total) : 0.0;
 
-    LLAMA_LOG_INFO(
+    LLAMA_LOG_WARN(
         "moe-residency: decodes=%llu touches=%llu hits=%llu misses=%llu evictions=%llu hit_rate=%.1f%%\n",
         (unsigned long long) st->decode_count,
         (unsigned long long) st->total_touched,

@@ -4383,7 +4383,7 @@ int32_t llama_moe_residency_enable(
     // Otherwise build happens lazily on next decode.
     if (ctx->sched_ready()) {
         if (llama_moe_residency_build(&ctx->get_model(), icfg, &ctx->moe_residency)) {
-            LLAMA_LOG_INFO("moe-residency: enabled for %d MoE layers (%d experts, %d used/token)\n",
+            LLAMA_LOG_WARN("moe-residency: enabled for %d MoE layers (%d experts, %d used/token)\n",
                     (int) ctx->moe_residency.layers.size(),
                     ctx->moe_residency.n_expert,
                     ctx->moe_residency.n_expert_used);
