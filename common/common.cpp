@@ -1320,6 +1320,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // eager build (if sched is already up) and deferred build (on next
     // decode via sched_reserve).
     if (params.moe_expert_residency) {
+        // Stash model path for coact persistence file location.
+        llama_set_model_path(lctx, params.model.path.c_str());
         struct llama_moe_residency_config rcfg = llama_moe_residency_config_default();
         rcfg.enabled                = 1;
         rcfg.max_resident_per_layer = (uint32_t) params.moe_resident_per_layer;

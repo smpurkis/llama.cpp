@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 
 #include "llama-moe-residency.h"
+#include "llama-moe-coact.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -429,6 +430,20 @@ public:
     // When cfg.enabled is true, the state is built after model load and
     // updated on every decode to keep hot experts paged in.
     llama_moe_residency_state moe_residency;
+
+    // Co-activation matrix (Phase 2). Tracks which experts fire together to
+    // predict future selections. Loaded from disk on init if available,
+    // saved on shutdown. Disabled by default; enabled by residency.
+    llama_moe_coact::matrix moe_coact;
+    std::string moe_coact_path;     // empty = not yet initialized
+    bool moe_coact_enabled = false;
+    // Last decode's per-layer selections (token 0 only for n_tokens > 1
+    // is used as anchor for cross-layer correlation).
+    std::vector<std::vector<int32_t>> moe_prev_layer_selection;
+
+    // Source model path, set by common_init_result or via llama_set_model_path.
+    // Used to derive the coact persistence file location.
+    std::string model_path;
 
 private:
 
