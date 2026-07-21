@@ -1255,8 +1255,33 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     }
 
     if (p0 > 0) {
-        if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max ||
-                p0 <= kv_raw->seq_pos_max(seq_id)) {
+        if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+            return false;
+        }
+
+        // Truncation semantics: drop cells with positions in [p0, +inf) so
+        // callers can set a new "current boundary" without rolling back past
+        // positions. The only structural safety constraint is no gap: p0 must
+        // not fall below the current min position for this seq_id, otherwise
+        // the cache would have a hole the model can't satisfy on the next
+        // prefill. Any p0 within [seq_pos_min, seq_pos_max] is safe: cells
+        // past p0 are dropped, cells before p0 keep their seq_id.
+        //
+        // This path is what server-context.cpp relies on after a checkpoint
+        // restore loads state with positions extending past the LCP. The
+        // compressor state tensors (csa_state, hca_state, lid_state) are
+        // intentionally NOT rolled back: the model recovers any bounded
+        // drift during prefill of the divergent tokens starting at p0,
+        // mirroring the seq_rm_positions_only pattern in
+        // llama_memory_recurrent.
+        //
+        // The previous check `p0 <= kv_raw->seq_pos_max(seq_id)` rejected
+        // all in-range p0 values, making this truncation path unreachable.
+        // That caused issue #8 to persist on DeepSeek-V4 / DSV4 models where
+        // the post-restore cleanup via llama_memory_seq_rm_attn_only is what
+        // keeps llama_batch_init's "Y = X + 1" validation passing.
+        const llama_pos cur_min = kv_raw->seq_pos_min(seq_id);
+        if (cur_min >= 0 && p0 < cur_min) {
             return false;
         }
 
