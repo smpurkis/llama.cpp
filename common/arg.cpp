@@ -2708,6 +2708,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LOAD_MODE"));
     add_opt(common_arg(
+        {"-moe-res", "--moe-expert-residency"},
+        {"-nmoe-res", "--no-moe-expert-residency"},
+        string_format("enable MoE expert residency tracking (reduces physical memory pressure of MoE models via madvise). "
+                      "Requires --mmap. (default: %s)", params.moe_expert_residency ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.moe_expert_residency = value;
+            if (value && !params.use_mmap) {
+                fprintf(stderr, "warning: --moe-expert-residency requires --mmap; ignoring\n");
+                params.moe_expert_residency = false;
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_RESIDENCY"));
+    add_opt(common_arg(
+        {"-moe-res-k", "--moe-resident-per-layer"}, "N",
+        string_format("max experts kept hot per MoE layer (default: %d)", params.moe_resident_per_layer),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("must be positive");
+            }
+            params.moe_resident_per_layer = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_RESIDENT_PER_LAYER"));
+    add_opt(common_arg(
+        {"-moe-pwk", "--moe-prewarm-top-k"}, "N",
+        string_format("experts to prewarm per layer at startup (default: %d)", params.moe_residency_top_k),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("must be >= 0");
+            }
+            params.moe_residency_top_k = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PREWARM_TOP_K"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"
