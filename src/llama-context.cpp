@@ -861,6 +861,13 @@ void llama_context::track_expert_activations(ggml_cgraph * gf, uint32_t /* n_tok
         // Read the expert indices from the tensor.
         const int64_t n_tok = node->ne[1];
         const int64_t stride = node->ne[0];
+        // Skip empty/placeholder tensors. ggml_nelements() returns 0 for
+        // tensors without backing storage (e.g. views/aliases produced by
+        // graph transforms that haven't been computed, or 0-size routing
+        // tensors on some MoE architectures). Reading from a 0-size vector
+        // is undefined behavior - it segfaults on libstdc++ because the
+        // vector's data() is a non-null but unallocated pointer.
+        if (n_tok <= 0 || stride <= 0 || ggml_nelements(node) == 0) continue;
 
         const size_t data_size = ggml_nelements(node) * sizeof(int32_t);
         std::vector<int32_t> expert_indices(data_size / sizeof(int32_t));
@@ -917,6 +924,8 @@ void llama_context::track_expert_activations(ggml_cgraph * gf, uint32_t /* n_tok
         const int64_t n_tok = node->ne[1];
         const int64_t n_exp = node->ne[0];
         if (n_exp != n_expert) continue;
+        // Skip empty tensors - same UB hazard as in the I32 pass above.
+        if (n_tok <= 0 || n_exp <= 0 || ggml_nelements(node) == 0) continue;
 
         const size_t data_size = ggml_nelements(node) * sizeof(float);
         std::vector<float> probs(data_size / sizeof(float));
