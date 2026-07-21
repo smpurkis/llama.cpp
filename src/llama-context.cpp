@@ -778,7 +778,45 @@ void llama_context::sched_reserve() {
     // compute has actually completed before reading argsort tensor data,
     // since track_expert_activations runs inside the per-ubatch loop and
     // graph_compute_async is asynchronous.
+// Helper: compute top-K expert IDs from a [n_expert, n_tokens] F32
+// probabilities tensor. Used as a fallback when the argsort/topk tensors
+// are stale or have invalid data (which can happen with graph reuse on
+// some architectures like Qwen3.6 35B-A3B).
+//
+// Performs a partial sort for each token to extract the top-K expert IDs.
+// O(n_expert * n_tokens) per call, which is negligible vs. the actual MoE
+// compute that follows.
+static void compute_topk_from_probs(
+        const float * probs, int64_t n_expert, int64_t n_tokens, int k,
+        std::vector<int32_t> & out_topk) {
+    out_topk.assign((size_t) n_tokens * (size_t) k, -1);
+    // For small n_expert and k, selection sort is fast enough and avoids
+    // allocations. n_expert typically < 1024 and k < 32.
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        const float * row = probs + (size_t) t * (size_t) n_expert;
+        // Find top-k via repeated argmax over un-selected entries.
+        std::vector<bool> taken((size_t) n_expert, false);
+        for (int e = 0; e < k; ++e) {
+            int best = -1;
+            float best_val = -1e30f;
+            for (int64_t i = 0; i < n_expert; ++i) {
+                if (taken[(size_t) i]) continue;
+                if (row[i] > best_val) {
+                    best_val = row[i];
+                    best = (int) i;
+                }
+            }
+            if (best < 0) break;
+            taken[(size_t) best] = true;
+            out_topk[(size_t) t * (size_t) k + (size_t) e] = best;
+        }
+    }
+}
+
 void llama_context::track_expert_activations(ggml_cgraph * gf, uint32_t /* n_tokens */) {
+    // Synchronize first to ensure the graph compute has actually completed
+    // before reading argsort tensor data, since track_expert_activations
+    // runs inside the per-ubatch loop and graph_compute_async is asynchronous.
     if (sched) {
         ggml_backend_sched_synchronize(sched.get());
     }
@@ -790,11 +828,17 @@ void llama_context::track_expert_activations(ggml_cgraph * gf, uint32_t /* n_tok
     const int64_t n_expert_used = model.hparams.n_expert_used;
     if (n_expert <= 0) return;  // Not an MoE model
 
-    // Search the compute graph for MoE routing tensors. We accept both
-    //   - "ffn_moe_argsort-<layer>": full sorted indices [n_expert, n_tokens]
-    //   - "ffn_moe_topk-<layer>":    top-K view [n_expert_used, n_tokens]
-    // and prefer the top-K view when available since it's smaller and
-    // contains exactly what we need.
+    // First pass: try to use ffn_moe_topk (I32 top-K view) or
+    // ffn_moe_argsort (I32 full sort) tensors if their data looks valid.
+    // Second pass (fallback): compute top-K from ffn_moe_probs (F32) if the
+    // I32 tensors have stale/garbage data (which can happen with graph
+    // reuse on some MoE architectures).
+
+    // Track which layers got valid data from the I32 path; the rest
+    // will be filled from the F32 path.
+    std::vector<char> layer_valid((size_t) n_layer, 0);
+
+    // Search the compute graph for MoE routing tensors.
     const int n_nodes = ggml_graph_n_nodes(gf);
     for (int i = 0; i < n_nodes; i++) {
         ggml_tensor * node = ggml_graph_node(gf, i);
@@ -815,8 +859,6 @@ void llama_context::track_expert_activations(ggml_cgraph * gf, uint32_t /* n_tok
         if (il < 0 || il >= n_layer) continue;
 
         // Read the expert indices from the tensor.
-        // For top-K: shape [n_expert_used, n_tokens], stride = n_expert_used.
-        // For argsort: shape [n_expert, n_tokens], stride = n_expert.
         const int64_t n_tok = node->ne[1];
         const int64_t stride = node->ne[0];
 
@@ -824,19 +866,29 @@ void llama_context::track_expert_activations(ggml_cgraph * gf, uint32_t /* n_tok
         std::vector<int32_t> expert_indices(data_size / sizeof(int32_t));
         ggml_backend_tensor_get(node, expert_indices.data(), 0, data_size);
 
-        // Update activation counts - only count the top-k experts per token.
+        // Validate: check that the first few values look like expert IDs.
+        // A common failure mode (e.g., Qwen graph reuse) is the tensor
+        // storage containing F32 probability values byte-interpreted as
+        // I32, which fail the n_expert range check below.
+        const int64_t n_check = std::min<int64_t>(stride, n_expert_used);
+        bool looks_valid = false;
+        for (int64_t k = 0; k < n_check && k < 4; ++k) {
+            const int32_t eid = expert_indices[k];
+            if (eid >= 0 && eid < (int32_t) n_expert) {
+                looks_valid = true;
+                break;
+            }
+        }
+        if (!looks_valid) continue;  // Fallback will handle this layer
+
+        // Update activation counts and capture per-token top-k.
         auto & stats = expert_stats[il];
         stats.total_tokens += n_tok;
 
-        // Capture per-token top-k selections for the most recent decode.
-        // Layout: [n_tokens * n_expert_used], row-major.
-        // Used by the MoE expert offload subsystem to pre-load experts that
-        // are likely to fire on the next decode (temporal locality).
-        const int64_t n_read = std::min<int64_t>(stride, n_expert_used);
         stats.last_selected.assign((size_t) n_tok * (size_t) n_expert_used, -1);
         stats.n_tokens_last = (int32_t) n_tok;
         for (int64_t t = 0; t < n_tok; t++) {
-            for (int64_t e = 0; e < n_read; e++) {
+            for (int64_t e = 0; e < n_check; e++) {
                 int32_t expert_id = expert_indices[t * stride + e];
                 if (expert_id >= 0 && expert_id < (int32_t)n_expert) {
                     stats.activation_count[expert_id]++;
@@ -844,6 +896,59 @@ void llama_context::track_expert_activations(ggml_cgraph * gf, uint32_t /* n_tok
                 }
             }
         }
+        layer_valid[(size_t) il] = 1;
+    }
+
+    // Fallback pass: for layers where the I32 tensors were unavailable or
+    // had invalid data, compute top-K from the F32 ffn_moe_probs tensor.
+    for (int i = 0; i < n_nodes; i++) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        if (!node) continue;
+        const char * name = ggml_get_name(node);
+        if (!name || name[0] == '\0') continue;
+        if (strstr(name, "ffn_moe_probs") == nullptr) continue;
+        if (node->type != GGML_TYPE_F32) continue;
+
+        int il = -1;
+        if (sscanf(name, "ffn_moe_probs-%d", &il) != 1) continue;
+        if (il < 0 || il >= n_layer) continue;
+        if (layer_valid[(size_t) il]) continue;  // already populated
+
+        const int64_t n_tok = node->ne[1];
+        const int64_t n_exp = node->ne[0];
+        if (n_exp != n_expert) continue;
+
+        const size_t data_size = ggml_nelements(node) * sizeof(float);
+        std::vector<float> probs(data_size / sizeof(float));
+        ggml_backend_tensor_get(node, probs.data(), 0, data_size);
+
+        // Sanity check: probabilities should be in [0, 1] range. If the
+        // data looks like byte patterns from a stale/garbled storage,
+        // skip this layer (better than emitting random expert IDs).
+        bool looks_like_probs = true;
+        for (int k = 0; k < std::min<int>((int) probs.size(), 8); ++k) {
+            const float v = probs[k];
+            if (v < -0.01f || v > 1.01f) {
+                looks_like_probs = false;
+                break;
+            }
+        }
+        if (!looks_like_probs) continue;
+
+        std::vector<int32_t> topk;
+        compute_topk_from_probs(probs.data(), n_exp, n_tok, (int) n_expert_used, topk);
+
+        auto & stats = expert_stats[il];
+        stats.total_tokens += n_tok;
+        stats.last_selected = std::move(topk);
+        stats.n_tokens_last = (int32_t) n_tok;
+        for (int64_t e = 0; e < (int64_t) stats.last_selected.size(); ++e) {
+            int32_t eid = stats.last_selected[(size_t) e];
+            if (eid >= 0 && eid < (int32_t) n_expert) {
+                stats.activation_count[eid]++;
+            }
+        }
+        layer_valid[(size_t) il] = 1;
     }
 }
 
