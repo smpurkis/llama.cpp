@@ -1492,6 +1492,13 @@ private:
                 params_base.cache_ssd_path.c_str(), &cfg,
                 (size_t)n_ctx, params_base.cache_ssd_max_checkpoints);
             ssd_page_manager->max_conversations = params_base.cache_ssd_max_conversations;
+            // Global cap on cold tier bytes across all conversation directories.
+            // 0 = unlimited (legacy default). Specified in MiB for parity with
+            // --cache-ssd-hot-ram / --cache-ssd-warm-ram.
+            ssd_page_manager->cold_max_size_bytes =
+                params_base.cache_ssd_cold_max_size_mib > 0
+                    ? (size_t)params_base.cache_ssd_cold_max_size_mib * 1024 * 1024
+                    : 0;
             ssd_page_manager->set_no_fsync(params_base.cache_ssd_no_fsync);
 
             // Set model info after page manager exists

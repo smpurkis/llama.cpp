@@ -247,6 +247,12 @@ bool server_context_page_manager::store_checkpoint_with_tokens(
     }
 
     checkpoints_.emplace(slot_id, std::move(sc2));
+
+    // Enforce global cold tier byte cap (--cache-ssd-cold-maxsize). Eviction
+    // happens after the store so writes never fail due to the cap; the cost
+    // is a brief overshoot of the cap until the next store triggers eviction.
+    evict_conversations_for_size_locked();
+
     return true;
 }
 
@@ -690,6 +696,172 @@ server_ssd_cache* server_context_page_manager::get_or_create_user_cache(const st
              user_id.c_str(), (unsigned long)key, user_caches_.size());
 
     return result;
+}
+
+} // namespace llama
+
+// =============================================================================
+// Cold tier global byte cap
+// =============================================================================
+
+namespace llama {
+
+size_t server_context_page_manager::compute_cold_total_bytes_locked() const {
+    auto sum_cache_bytes = [](const kv_ssd_cache* cache) -> size_t {
+        if (!cache) return 0;
+        size_t total = 0;
+        // Index holds cold entries until they're ring-buffer-evicted or
+        // explicitly deleted. Hot/warm entries also stay in the index,
+        // so filter by tier to avoid double-counting RAM blobs as SSD usage.
+        for (const auto& [id, ckpt] : cache->index) {
+            if (ckpt.tier == KV_TIER_COLD) {
+                total += ckpt.data_size + ckpt.dft_data_size + ckpt.spec_data_size;
+            }
+        }
+        return total;
+    };
+
+    size_t total = 0;
+    for (const auto& [conv, cache] : conv_caches_) {
+        total += sum_cache_bytes(cache.get());
+    }
+    for (const auto& [key, cache] : user_caches_) {
+        total += sum_cache_bytes(cache.get());
+    }
+    return total;
+}
+
+void server_context_page_manager::evict_conversations_for_size_locked() {
+    if (cold_max_size_bytes == 0) return;
+
+    size_t total = compute_cold_total_bytes_locked();
+    if (total <= cold_max_size_bytes) return;
+
+    // Build the eviction candidate list: (mtime, namespace, key).
+    // Anonymous caches live directly under ssd_base_path_; user caches live
+    // under ssd_base_path_/u/. We scan both namespaces together so a single
+    // conversation is one candidate regardless of where it lives on disk.
+    struct candidate {
+        time_t mtime;
+        bool is_user;
+        uint64_t key;
+    };
+    std::vector<candidate> candidates;
+
+    auto mtime_for = [](const fs::path& dir) -> time_t {
+        std::error_code ec;
+        auto ftime = fs::last_write_time(dir, ec);
+        if (ec) return 0;
+        return std::chrono::system_clock::to_time_t(
+            std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                ftime - fs::file_time_type::clock::now() + std::chrono::system_clock::now()));
+    };
+
+    candidates.reserve(conv_caches_.size() + user_caches_.size());
+    for (const auto& conv_pair : conv_caches_) {
+        char hex[17];
+        snprintf(hex, sizeof(hex), "%016lx", (unsigned long)conv_pair.first);
+        candidates.push_back({ mtime_for(fs::path(ssd_base_path_) / hex), false, conv_pair.first });
+    }
+    for (const auto& user_pair : user_caches_) {
+        char hex[17];
+        snprintf(hex, sizeof(hex), "%016lx", (unsigned long)user_pair.first);
+        candidates.push_back({ mtime_for(fs::path(ssd_base_path_) / "u" / hex), true, user_pair.first });
+    }
+
+    // Oldest first - matches the existing --cache-ssd-max-conversations
+    // behavior so the two caps evict consistently.
+    std::sort(candidates.begin(), candidates.end(),
+        [](const candidate& a, const candidate& b) { return a.mtime < b.mtime; });
+
+    size_t evicted = 0;
+    for (const auto& c : candidates) {
+        if (total <= cold_max_size_bytes) break;
+
+        char hex[17];
+        snprintf(hex, sizeof(hex), "%016lx", (unsigned long)c.key);
+        fs::path dir = c.is_user
+            ? fs::path(ssd_base_path_) / "u" / hex
+            : fs::path(ssd_base_path_) / hex;
+
+        // Measure this conversation's contribution before deleting so the log
+        // line tells the user how much disk was actually reclaimed.
+        size_t freed = 0;
+        if (c.is_user) {
+            auto it = user_caches_.find(c.key);
+            if (it != user_caches_.end()) {
+                for (const auto& [id, ckpt] : it->second->index) {
+                    if (ckpt.tier == KV_TIER_COLD) {
+                        freed += ckpt.data_size + ckpt.dft_data_size + ckpt.spec_data_size;
+                    }
+                }
+            }
+        } else {
+            auto it = conv_caches_.find(c.key);
+            if (it != conv_caches_.end()) {
+                for (const auto& [id, ckpt] : it->second->index) {
+                    if (ckpt.tier == KV_TIER_COLD) {
+                        freed += ckpt.data_size + ckpt.dft_data_size + ckpt.spec_data_size;
+                    }
+                }
+            }
+        }
+
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator(dir, ec)) {
+            std::error_code ec2;
+            fs::remove(entry.path(), ec2);
+        }
+        fs::remove(dir, ec);
+
+        if (c.is_user) {
+            user_wrappers_.erase(c.key);
+            user_caches_.erase(c.key);
+        } else {
+            conv_wrappers_.erase(c.key);
+            conv_caches_.erase(c.key);
+        }
+
+        // Drop any in-memory checkpoint entries that belonged to the evicted
+        // conversation. Without this, a slot whose checkpoint was just freed
+        // would still appear in checkpoints_ and trigger load failures.
+        for (auto it = checkpoints_.begin(); it != checkpoints_.end(); ) {
+            // The evicted conversation may have owned checkpoint IDs that are
+            // no longer in any remaining cache. Drop those slot entries so a
+            // subsequent load doesn't try to restore from freed disk state.
+            // The next store for that slot will recreate the entry cleanly.
+            uint64_t cid = it->second.checkpoint_id;
+            bool found = false;
+            for (const auto& [cv, cache] : conv_caches_) {
+                if (cache->index.count(cid)) { found = true; break; }
+            }
+            if (!found) {
+                for (const auto& [uk, cache] : user_caches_) {
+                    if (cache->index.count(cid)) { found = true; break; }
+                }
+            }
+            if (!found) {
+                it = checkpoints_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        total = (freed > total) ? 0 : total - freed;
+        evicted++;
+
+        LOG_WRN("SSD cache: evicted conversation %skey=%016lx (%zu MiB freed, total=%zu MiB, cap=%zu MiB)\n",
+                c.is_user ? "user " : "",
+                (unsigned long)c.key,
+                freed / (1024 * 1024),
+                total / (1024 * 1024),
+                cold_max_size_bytes / (1024 * 1024));
+    }
+
+    if (evicted > 0) {
+        LOG_INF("SSD cache: --cache-ssd-cold-maxsize enforced (evicted=%zu, total=%zu MiB, cap=%zu MiB)\n",
+                evicted, total / (1024 * 1024), cold_max_size_bytes / (1024 * 1024));
+    }
 }
 
 } // namespace llama

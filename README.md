@@ -69,6 +69,7 @@ Cold prompt eval rate: 109.9-133.4 t/s. Cached: 15,717/15,721 tokens restored fr
 | `--cache-ssd-max-conversations N` | 16 | Max conversation directories |
 | `--cache-ssd-hot-ram N` | auto | Hot tier RAM budget in MiB (0 = auto) |
 | `--cache-ssd-warm-ram N` | auto | Warm tier RAM budget in MiB (0 = auto) |
+| `--cache-ssd-cold-maxsize N` | 0 | Global cap on total cold tier bytes across all conversations in MiB (0 = unlimited). When exceeded, oldest conversations are evicted as whole directories. |
 
 ### System prompt cache
 
