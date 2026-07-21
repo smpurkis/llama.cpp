@@ -1644,6 +1644,11 @@ extern "C" {
     // Clear the most recent expert selection snapshot (forces re-warm on next decode).
     LLAMA_API void llama_expert_last_selected_clear(struct llama_context * ctx);
 
+    // Set the source model path. Used by the MoE residency subsystem to
+    // derive the co-activation persistence file location. Caller may pass
+    // an empty string to disable persistence.
+    LLAMA_API void llama_set_model_path(struct llama_context * ctx, const char * path);
+
     //
     // MoE expert residency (Phase 1, madvise-based)
     //

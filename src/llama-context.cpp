@@ -4,6 +4,7 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-moe-residency.h"
+#include "llama-moe-coact.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -490,6 +491,11 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // Save co-activation matrix to disk before releasing residency state.
+    if (moe_coact_enabled && !moe_coact_path.empty()) {
+        llama_moe_coact::save(moe_coact, moe_coact_path);
+    }
+
     // Release MoE residency state first (calls MADV_DONTNEED on all hot
     // expert pages before the mmap is torn down).
     if (moe_residency.cfg.enabled) {
@@ -721,10 +727,26 @@ void llama_context::sched_reserve() {
     // for madvise-based residency management.
     if (moe_residency.cfg.enabled && moe_residency.layers.empty()) {
         if (llama_moe_residency_build(&model, moe_residency.cfg, &moe_residency)) {
-            LLAMA_LOG_INFO("moe-residency: enabled for %d MoE layers (%d experts, %d used/token)\n",
+            LLAMA_LOG_WARN("moe-residency: enabled for %d MoE layers (%d experts, %d used/token)\n",
                     (int) moe_residency.layers.size(),
                     moe_residency.n_expert,
                     moe_residency.n_expert_used);
+
+            // Initialize co-activation matrix and try to load persisted data.
+            llama_moe_coact::init(moe_coact, model);
+            if (!model_path.empty()) {
+                moe_coact_path = llama_moe_coact::persistence_path(model_path);
+                if (llama_moe_coact::load(moe_coact, moe_coact_path)) {
+                    LLAMA_LOG_WARN("moe-coact: loaded %d layers x %d experts from %s\n",
+                            moe_coact.num_layers, moe_coact.num_experts,
+                            moe_coact_path.c_str());
+                } else {
+                    LLAMA_LOG_WARN("moe-coact: no persisted data at %s, starting fresh\n",
+                            moe_coact_path.c_str());
+                }
+            }
+            moe_coact_enabled = true;
+
             if (moe_residency.cfg.prewarm_on_init) {
                 std::vector<std::vector<int>> top;
                 llama_moe_residency_topk_from_stats(this, moe_residency.cfg.prewarm_top_k, top);
@@ -2036,6 +2058,42 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (moe_residency.cfg.log_per_decode &&
                 (moe_residency.decode_count % 16) == 0) {
                 llama_moe_residency_log_stats(&moe_residency);
+            }
+        }
+
+        // Record per-layer selections into the co-activation matrix for
+        // future predictions. Only the first token (t=0) is used as the
+        // anchor for cross-layer correlation to avoid N^2 blow-up.
+        if (moe_coact_enabled && expert_tracking_enabled && ubatch.n_tokens >= 1) {
+            const int n_layer_model = (int) expert_stats.size();
+            for (int il = 0; il < n_layer_model; ++il) {
+                const auto & stats = expert_stats[il];
+                if (stats.last_selected.empty()) continue;
+                // First token's selections: [0, n_expert_used) entries.
+                const int n_used = model.hparams.n_expert_used;
+                llama_moe_coact::record(
+                    moe_coact, il, stats.last_selected.data(), n_used);
+                // Cross-layer with previous decode (token 0 only).
+                if (il < (int) moe_prev_layer_selection.size() &&
+                    !moe_prev_layer_selection[il].empty()) {
+                    llama_moe_coact::record_cross_layer(
+                        moe_coact,
+                        il,
+                        moe_prev_layer_selection[il].data(),
+                        (int) moe_prev_layer_selection[il].size(),
+                        stats.last_selected.data(),
+                        n_used);
+                }
+                // Save first token's selection for next cross-layer.
+                if (moe_prev_layer_selection.size() != (size_t) n_layer_model) {
+                    moe_prev_layer_selection.resize(n_layer_model);
+                }
+                if ((int) moe_prev_layer_selection[il].size() != n_used) {
+                    moe_prev_layer_selection[il].resize(n_used);
+                }
+                for (int e = 0; e < n_used; ++e) {
+                    moe_prev_layer_selection[il][e] = stats.last_selected[e];
+                }
             }
         }
 
@@ -4470,4 +4528,9 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+void llama_set_model_path(struct llama_context * ctx, const char * path) {
+    if (!ctx || !path) return;
+    ctx->model_path = path;
 }

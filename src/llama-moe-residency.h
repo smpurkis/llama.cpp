@@ -55,10 +55,27 @@ struct llama_moe_layer_residency_internal {
     // Number of experts in this layer (= model.hparams.n_expert).
     int n_expert = 0;
 
-    // Shared LRU across all tensors of this layer. An expert_id is "hot"
-    // if it appears in this deque. Capacity clamps via max_resident.
-    std::deque<int> lru;
-    std::unordered_set<int> loaded_set;
+    // Recency+frequency cache (Phase 2). Replaces the Phase 1 deque-based LRU.
+    // Each entry tracks when it was last accessed and how many times.
+    // Eviction score (lower = more evictable):
+    //   0.5 * (1 / (1 + current_token - last_access)) +
+    //   0.5 * (access_count / (1 + current_token - loaded_at))
+    // This addresses the FlashMoE finding that pure LRU evicts hot
+    // experts 34% of the time.
+    struct cache_entry {
+        int     expert_id      = -1;
+        uint64_t last_access   = 0;   // token counter at last touch
+        uint64_t access_count  = 0;   // total touches since loaded
+        uint64_t loaded_at     = 0;   // token counter when first loaded
+        // Whether this slot is occupied (expert_id != -1).
+        bool    occupied       = false;
+    };
+    std::vector<cache_entry> cache;            // size = max_resident_per_layer
+    // Reverse map: expert_id -> slot index in `cache`, or -1 if not loaded.
+    std::vector<int>        slot_of;           // size = n_expert
+    // Token counter incremented per touch_layer_selection. Used to compute
+    // recency and frequency scores.
+    uint64_t                token_counter = 0;
 
     uint64_t hits   = 0;
     uint64_t misses = 0;
