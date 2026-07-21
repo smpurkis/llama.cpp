@@ -790,11 +790,11 @@ void llama_context::track_expert_activations(ggml_cgraph * gf, uint32_t /* n_tok
     const int64_t n_expert_used = model.hparams.n_expert_used;
     if (n_expert <= 0) return;  // Not an MoE model
 
-    // Search the compute graph for "ffn_moe_argsort" tensors.
-    // These are the output of ggml_argsort and contain ALL expert indices
-    // sorted by descending probability. Shape: [n_expert, n_tokens].
-    // The top n_expert_used entries per token are the selected experts.
-    // The tensor name format is "ffn_moe_argsort-<layer>".
+    // Search the compute graph for MoE routing tensors. We accept both
+    //   - "ffn_moe_argsort-<layer>": full sorted indices [n_expert, n_tokens]
+    //   - "ffn_moe_topk-<layer>":    top-K view [n_expert_used, n_tokens]
+    // and prefer the top-K view when available since it's smaller and
+    // contains exactly what we need.
     const int n_nodes = ggml_graph_n_nodes(gf);
     for (int i = 0; i < n_nodes; i++) {
         ggml_tensor * node = ggml_graph_node(gf, i);
@@ -803,27 +803,28 @@ void llama_context::track_expert_activations(ggml_cgraph * gf, uint32_t /* n_tok
         const char * name = ggml_get_name(node);
         if (!name || name[0] == '\0') continue;
 
-        // Match "ffn_moe_argsort" prefix
-        if (strstr(name, "ffn_moe_argsort") == nullptr) continue;
+        const bool is_topk = (strstr(name, "ffn_moe_topk") != nullptr);
+        const bool is_argsort = !is_topk && (strstr(name, "ffn_moe_argsort") != nullptr);
+        if (!is_topk && !is_argsort) continue;
 
         if (node->type != GGML_TYPE_I32) continue;
 
-        // Extract layer index from name: "ffn_moe_argsort-<layer>"
+        // Extract layer index from name.
         int il = -1;
-        if (sscanf(name, "ffn_moe_argsort-%d", &il) != 1) continue;
+        if (sscanf(name, is_topk ? "ffn_moe_topk-%d" : "ffn_moe_argsort-%d", &il) != 1) continue;
         if (il < 0 || il >= n_layer) continue;
 
-        // Read the expert indices from the argsort tensor.
-        // Shape: [n_expert, n_tokens] - all experts sorted by probability descending.
-        // The first n_expert_used entries per token are the selected experts.
+        // Read the expert indices from the tensor.
+        // For top-K: shape [n_expert_used, n_tokens], stride = n_expert_used.
+        // For argsort: shape [n_expert, n_tokens], stride = n_expert.
         const int64_t n_tok = node->ne[1];
-        const int64_t stride = node->ne[0]; // n_expert
+        const int64_t stride = node->ne[0];
 
         const size_t data_size = ggml_nelements(node) * sizeof(int32_t);
         std::vector<int32_t> expert_indices(data_size / sizeof(int32_t));
         ggml_backend_tensor_get(node, expert_indices.data(), 0, data_size);
 
-        // Update activation counts - only count the top-k experts per token
+        // Update activation counts - only count the top-k experts per token.
         auto & stats = expert_stats[il];
         stats.total_tokens += n_tok;
 
@@ -831,10 +832,11 @@ void llama_context::track_expert_activations(ggml_cgraph * gf, uint32_t /* n_tok
         // Layout: [n_tokens * n_expert_used], row-major.
         // Used by the MoE expert offload subsystem to pre-load experts that
         // are likely to fire on the next decode (temporal locality).
+        const int64_t n_read = std::min<int64_t>(stride, n_expert_used);
         stats.last_selected.assign((size_t) n_tok * (size_t) n_expert_used, -1);
         stats.n_tokens_last = (int32_t) n_tok;
         for (int64_t t = 0; t < n_tok; t++) {
-            for (int64_t e = 0; e < n_expert_used; e++) {
+            for (int64_t e = 0; e < n_read; e++) {
                 int32_t expert_id = expert_indices[t * stride + e];
                 if (expert_id >= 0 && expert_id < (int32_t)n_expert) {
                     stats.activation_count[expert_id]++;
