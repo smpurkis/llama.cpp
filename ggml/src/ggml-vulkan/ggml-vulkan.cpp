@@ -10606,14 +10606,41 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         const uint64_t k_f16_sz = (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t);
         const uint64_t v_f16_sz = (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t);
         const uint64_t required = k_f16_sz + v_f16_sz + ctx->device->fa_scratch_safety_bytes;
-        if (required > common::host_available_ram()) {
-            static std::atomic<bool> warned{false};
-            if (!warned.exchange(true)) {
-                GGML_LOG_WARN("ggml_vulkan: FA quant-KV dequant scratch (%llu MiB incl. %llu MiB safety) exceeds host RAM; using slow path. Set GGML_VK_NO_FA_SCRATCH_TRANSPOSE=1 to silence this check.\n",
-                              (unsigned long long) (required / (1024ULL * 1024ULL)),
-                              (unsigned long long) (ctx->device->fa_scratch_safety_bytes / (1024ULL * 1024ULL)));
+
+        // host_available_ram_query returns false on platforms we can't read
+        // reliably (Windows, kernels older than 3.14, sysinfo() failure).
+        // When the answer is unknown, fall back to the slow path rather than
+        // risk an OOM by trusting a fabricated 8 GiB.
+        std::size_t avail_ram = 0;
+        bool known = common::host_available_ram_query(&avail_ram);
+
+        if (!known) {
+            static std::atomic<bool> warned_unknown{false};
+            if (!warned_unknown.exchange(true)) {
+                GGML_LOG_WARN("ggml_vulkan: FA quant-KV scratch gate: cannot query host RAM on this platform; "
+                              "using slow path. Set GGML_VK_FA_SCRATCH_FORCE=1 to override, "
+                              "or GGML_VK_NO_FA_SCRATCH_TRANSPOSE=1 to silence.\n");
             }
             use_dequant_kv = false;
+        } else {
+            // On UMA hardware (Strix Halo, Apple Silicon, AMD APU, Intel
+            // integrated) the GPU memory pool IS host RAM. MemAvailable
+            // counts the reclaimable page cache, but reclaiming it hurts
+            // SSD read-ahead and other system services. Reserve a 30%
+            // headroom so the kernel doesn't have to thrash cache to satisfy
+            // a scratch allocation on the GPU side.
+            if (ctx->device->uma) {
+                avail_ram = (avail_ram * 7) / 10;
+            }
+            if (required > avail_ram) {
+                static std::atomic<bool> warned{false};
+                if (!warned.exchange(true)) {
+                    GGML_LOG_WARN("ggml_vulkan: FA quant-KV dequant scratch (%llu MiB incl. %llu MiB safety) exceeds host RAM; using slow path. Set GGML_VK_NO_FA_SCRATCH_TRANSPOSE=1 to silence this check.\n",
+                                  (unsigned long long) (required / (1024ULL * 1024ULL)),
+                                  (unsigned long long) (ctx->device->fa_scratch_safety_bytes / (1024ULL * 1024ULL)));
+                }
+                use_dequant_kv = false;
+            }
         }
     }
     const ggml_type k_type_eff = use_dequant_kv ? GGML_TYPE_F16 : k->type;

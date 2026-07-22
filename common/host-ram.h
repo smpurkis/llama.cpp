@@ -4,15 +4,13 @@
 // Cross-platform available-RAM query used by auto-sizing code paths in
 // common/ and by the Vulkan FA scratch gate in ggml/src/ggml-vulkan/.
 //
-// Linux:   sysinfo.freeram * mem_unit. Free RAM in bytes; the kernel will
-//          reclaim the page cache on demand so this is what auto-sizing
-//          actually wants.
-// macOS:   hw.memsize (total) as fallback, vm_statistics64 free + inactive
-//          as the real answer. Inactive is Apple's reclaimable page cache
-//          bucket, same semantics as Linux's free+cache.
-// Other:   8 GiB conservative fallback. Lets the feature ship on Windows
-//          and exotic platforms without crashing; users on those platforms
-//          should configure explicitly rather than rely on auto-sizing.
+// Two access patterns:
+//   host_available_ram_query()  - returns a real reading or signals unknown;
+//                                 callers that must distinguish "real" from
+//                                 "fallback guess" should use this.
+//   host_available_ram()        - same but with an 8 GiB conservative
+//                                 fallback so legacy auto-sizing callers
+//                                 don't have to think about it.
 
 #pragma once
 
@@ -20,10 +18,15 @@
 
 namespace common {
 
-// Returns currently available RAM in bytes. On Linux/macOS this is the
-// reclaimable memory (free + cache / inactive). On other platforms an 8
-// GiB fallback. Safe to call frequently - the underlying syscalls are
-// cheap and read-only.
+// True and sets *out_bytes to currently available RAM (free + reclaimable) on
+// supported platforms. False (and *out_bytes = 0) when the answer is unreliable
+// (Windows, exotic platforms, kernel older than 3.14, sysinfo() failure).
+// Out param must be non-null.
+bool host_available_ram_query(std::size_t * out_bytes);
+
+// Currently available RAM in bytes. On Linux/macOS this is the reclaimable
+// memory (free + cache / inactive). On unsupported platforms an 8 GiB fallback.
+// Safe to call frequently - the underlying syscalls are cheap and read-only.
 std::size_t host_available_ram();
 
 }  // namespace common
