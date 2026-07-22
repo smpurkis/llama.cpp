@@ -36,11 +36,13 @@
 //
 // The same shape of bug also affects DeepSeek-V4 (DSV4) models, which use
 // llama_kv_cache_dsv4 (not the hybrid mem_attn + mem_recr layout). DSV4's
-// seq_pos_min/max both report kv_raw->seq_pos_max, so the post-restore
-// cleanup needs to actually truncate the kv_raw cells for llama_batch_init's
-// "Y = X + 1" check to pass. The fix on the DSV4 side relaxes an over-strict
-// safety gate in llama_kv_cache_dsv4::seq_rm that previously made this
-// truncation path unreachable.
+// seq_pos_min intentionally returns kv_raw->seq_pos_max so server-context
+// cannot roll back via checkpoint search, so a "p0 < seq_pos_min" safety
+// gate is broken-by-design on DSV4 (cur_min == seq_pos_max rejects every
+// in-range p0). The fix on the DSV4 side removes that gate from
+// llama_kv_cache_dsv4::seq_rm so the truncation path actually runs and
+// drops stale kv_raw cells past the LCP, letting llama_batch_init's
+// "Y = X + 1" check pass.
 
 #include "arg.h"
 #include "common.h"
