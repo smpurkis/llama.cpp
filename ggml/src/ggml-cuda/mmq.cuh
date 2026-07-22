@@ -3390,6 +3390,28 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q6_K> {
     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q6_K_q8_1_dp4a<mmq_x, mmq_y>;
 };
 
+// Per-thread entries in the `sum[]` accumulator used by `mul_mat_q_process_tile`.
+// The accumulator is consumed by BOTH the dp4a write_back path (indexed as
+// (j0/nwarps)*(I/warp_size) + i0/warp_size) AND the MMA write_back path
+// (indexed as (j0/tile_C::J + n)*tile_C::ne + l). The MMA path can write
+// past the dp4a allocation, particularly when J is not a multiple of
+// tile_C::J (the inner loop runs the full ntx*ceil(J/tile_C::J) iterations
+// even for the tail tile). RDNA3.5 with tile_C<16,16>, ntx=1, tile_C::ne=8
+// needs ceil(J/16)*8 entries; the worst case across known MMA configs
+// (non-AMD tile<16,8> with ntx=2, tile_C::ne=4) needs ceil(J/8)*8.
+template <ggml_type type, int J, bool fallback>
+static constexpr int mmq_get_sum_size() {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+
+    constexpr int sum_dp4a = ((J + nwarps - 1) / nwarps)
+                            * ((I + warp_size - 1) / warp_size);
+    constexpr int sum_mma  = ((J + 7) / 8) * 8;
+
+    return sum_dp4a > sum_mma ? sum_dp4a : sum_mma;
+}
+
 template <int mmq_x, int mmq_y, bool need_check>
 struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_IQ2_XXS> {
     static constexpr int              vdr          = VDR_IQ2_XXS_Q8_1_MMQ;
@@ -3489,7 +3511,11 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int ITER_K          = get_iter_k(type);
     constexpr int blocks_per_iter = ITER_K / qk;
 
-    float sum[mmq_x*mmq_y / (nwarps*warp_size)] = {0.0f};
+    // Sized for the larger of the dp4a and MMA per-thread accumulator layouts
+    // (see mmq_get_sum_size); the original `J*I/(nwarps*warp_size)` under-sized
+    // the MMA path on RDNA3.5 (gfx1151), which was the root cause of
+    // fewtarius/llama-ai#8 mul_mat_q HSA memory faults for Q4_0 J=40.
+    float sum[mmq_get_sum_size<type, mmq_x, need_check>()] = {0.0f};
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
