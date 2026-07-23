@@ -269,6 +269,9 @@ set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-downlo
 # Regression test for fewtarius/llama-ai issue #6:
 # SSD cache auto-sizing must respect --cache-ssd-hot-ram / --cache-ssd-warm-ram.
 llama_build_and_test(test-ssd-cache-caps.cpp)
+# Continuation matching must consider long (n_tokens > ~4551) checkpoints,
+# not just the bounded 4096-token prefix. Normalize overlap by token_count.
+llama_build_and_test(test-ssd-cache-continuation.cpp)
 llama_build_and_test(test-ssd-cache-prefix-match.cpp)
 llama_build_and_test(test-arg-parser.cpp)
 

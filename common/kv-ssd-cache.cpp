@@ -1112,14 +1112,17 @@ uint64_t kv_ssd_find_continuation(
                 else break;
             }
 
-            // Score: how much of the checkpoint's token range is covered
-            // by the matching prefix. Using n_tokens (not token_count) because
-            // n_tokens is the actual checkpoint size - if the LCP covers most
-            // of n_tokens, the checkpoint's recurrent state is mostly valid.
-            // Cap at 1.0 since LCP can exceed n_tokens when the stored prefix
-            // extends beyond the checkpoint's token range.
-            float score = (rec.n_tokens > 0)
-                ? std::min(1.0f, (float)matches / (float)rec.n_tokens)
+            // Score: how much of the checkpoint's verifiable prefix we matched.
+            // matches is bounded by KV_SSD_TOKEN_PREFIX_MAX (4096) - that's all
+            // the prefix we ever store. Normalizing by n_tokens (the full state
+            // extent) made any checkpoint past ~4551 tokens invisible: with the
+            // default 0.90 min_overlap, matches/n_tokens caps at 4096/n_tokens
+            // and never reaches threshold. Normalize by token_count instead -
+            // a full-prefix match scores 1.0 regardless of total depth.
+            // token_count <= KV_SSD_TOKEN_PREFIX_MAX always (cap in kv_ssd_store),
+            // so the ratio is bounded by 1.0.
+            float score = (rec.token_count > 0)
+                ? std::min(1.0f, (float)matches / (float)rec.token_count)
                 : 0.0f;
             if (score > best_conv_score) best_conv_score = score;
         }
