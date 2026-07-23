@@ -10607,11 +10607,13 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     bool use_dequant_kv = !ctx->device->fa_no_scratch_transpose &&
                           k_quant && v_quant && N >= 64 &&
                           k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
+                          k->nb[1] >= k->nb[2] && v->nb[1] >= v->nb[2] &&
                           ggml_is_contiguously_allocated(k) && ggml_is_contiguously_allocated(v) &&
                           (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
                           (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t) <= ctx->device->properties.limits.maxStorageBufferRange &&
                           ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
-                          ctx->device->pipeline_dequant_transpose[v->type] != nullptr;
+                          ctx->device->pipeline_dequant_transpose[v->type] != nullptr &&
+                          !ctx->device->coopmat2;
     if (use_dequant_kv && !ctx->device->fa_scratch_force) {
         const uint64_t k_f16_sz = (uint64_t)ggml_nelements(k) * sizeof(ggml_fp16_t);
         const uint64_t v_f16_sz = (uint64_t)ggml_nelements(v) * sizeof(ggml_fp16_t);
