@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2026 fewtarius
-
 #undef NDEBUG
 
 #include "kv-ssd-cache.h"

@@ -882,6 +882,9 @@ uint64_t kv_ssd_find_match(kv_ssd_cache* cache,
             else break;
         }
 
+        // The stored prefix only narrows the candidate set. A checkpoint is
+        // reusable only when the complete token range represented by its state
+        // matches the stored hash.
         if (lcp == 0) continue;
         if (tokens_size < ckpt.n_tokens) continue;
         if (ckpt.token_hash != kv_ssd_hash_tokens(tokens, ckpt.n_tokens)) continue;
