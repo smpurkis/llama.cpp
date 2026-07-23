@@ -371,7 +371,7 @@ static bool ggml_cuda_is_aligned(const ggml_tensor * tensor, const size_t alignm
            tensor->nb[3] % alignment == 0;
 }
 
-static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
+static constexpr __host__ __device__ int ggml_cuda_get_physical_warp_size() {
 #if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
     return 64;
 #else
