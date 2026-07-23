@@ -634,9 +634,9 @@ uint64_t kv_ssd_store(kv_ssd_cache* cache,
 
     uint64_t id = cache->next_id++;
 
-    // Compute token hash
-    uint64_t token_hash = kv_ssd_hash_tokens(tokens, tokens_size);
-    size_t token_count = tokens ? std::min(tokens_size, (size_t)KV_SSD_TOKEN_PREFIX_MAX) : 0;
+    const size_t checkpoint_tokens = std::min(tokens_size, (size_t)n_tokens);
+    uint64_t token_hash = kv_ssd_hash_tokens(tokens, checkpoint_tokens);
+    size_t token_count = tokens ? std::min(checkpoint_tokens, (size_t)KV_SSD_TOKEN_PREFIX_MAX) : 0;
 
     // Build record header
     kv_ssd_record rec;
@@ -882,10 +882,9 @@ uint64_t kv_ssd_find_match(kv_ssd_cache* cache,
             else break;
         }
 
-        // Accept checkpoints with any non-zero LCP. The caller validates
-        // the LCP ratio (e.g. hybrid models require >= 80%). Same-conversation
-        // checkpoints will have lcp == cmp_count (full prefix match).
         if (lcp == 0) continue;
+        if (tokens_size < ckpt.n_tokens) continue;
+        if (ckpt.token_hash != kv_ssd_hash_tokens(tokens, ckpt.n_tokens)) continue;
 
         // Prefer highest LCP first (most cache reuse). Break ties by
         // most recent turn, then by more tokens within the same turn.
