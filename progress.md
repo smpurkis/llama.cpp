@@ -534,7 +534,7 @@ they belong in a separate Vulkan-specific tracking document if needed.
 | # | Optimization | Commit(s) | ROCm gain |
 |---|---|---|---|
 | 1 | GQA-dequant tile FA decode fix | `5cf8b7a5c`, `c4f21afe1` | **+127–322% tg@32–128k** q8_0 |
-| 2 | **PR #16827 rocWMMA prefill tuning** | `a3c9d1d` | pp gains expected at 4096/16384/65536 |
+| 2 | **PR #16827 rocWMMA prefill tuning** | `a3c9d1d` | pp gains expected at 4096/16384/65536 (build: ✅ verified) |
 | 3 | MMQ RDNA3_5 tuning (`mmq_x=48, mmq_y=64, nwarps=4`) | `db7ce487a`, `b6face667` | **+50–70% pp** short ctx |
 | 4 | `sudot4` for RDNA3.5 (`__builtin_amdgcn_sudot4`) | upstream `common.cuh:699` | included |
 | 5 | `__float2int_rn` in quantize.cu | upstream `quantize.cu:65` | included |
