@@ -3400,7 +3400,7 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q6_K> {
 // needs ceil(J/16)*8 entries; the worst case across known MMA configs
 // (non-AMD tile<16,8> with ntx=2, tile_C::ne=4) needs ceil(J/8)*8.
 template <ggml_type type, int J, bool fallback>
-static constexpr int mmq_get_sum_size() {
+static constexpr __host__ __device__ int mmq_get_sum_size() {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
