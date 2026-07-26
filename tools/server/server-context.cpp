@@ -2726,17 +2726,13 @@ private:
         if (params_base.n_ctx_checkpoints <= 0) return;
         if (!slot.task || slot.task->type != SERVER_TASK_TYPE_COMPLETION) return;
 
-        auto done_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
-        auto done_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
-        int64_t done_n_tokens = done_pos_max + 1;
+        // Use prompt positions, not generation positions.
+        // The generation positions (done_pos_min/done_pos_max) extend past
+        // the prompt end and cause stale positions to persist after restore,
+        // triggering "Invalid input batch" on the next turn (issue #8).
+        const int64_t prompt_n_tokens = slot.prompt.n_tokens();
+        if (prompt_n_tokens < 64) return;
 
-        // Cap to prevent overflow guard on warm restart.
-        // The guard subtracts 8 when n_past >= task.n_tokens; stay well below.
-        if (done_n_tokens >= (int64_t)slot.task->n_tokens()) {
-            done_n_tokens = (int64_t)slot.task->n_tokens() - 4;
-        }
-
-        if (done_pos_min < 0 || done_n_tokens < 64) return;
         // Deferred checkpoint always captures final state. Skip the proximity
         // guard used for mid-prompt checkpoints — the deferred ckpt is never
         // "too close" to a prior ckpt; it's the most complete snapshot.
@@ -2753,7 +2749,8 @@ private:
         }
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
-        cur.update_pos(done_n_tokens, done_pos_min, done_pos_max);
+        // Save prompt boundaries: pos_min=0 (start of prompt), pos_max=prompt_n_tokens-1 (end of prompt)
+        cur.update_pos(prompt_n_tokens, 0, (llama_pos)prompt_n_tokens - 1);
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
