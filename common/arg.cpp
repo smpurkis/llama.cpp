@@ -2706,15 +2706,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "model loading mode (default: mmap)\n"
         "- none: no special loading mode\n"
         "- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)\n"
-        "- mlock: force system to keep model in RAM rather than swapping or compressing\n"
-        "- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing\n"
+        "- mlock: mmap + force system to keep model in RAM rather than swapping or compressing\n"
         "- dio: use DirectIO if available\n",
         [](common_params & params, const std::string & value) {
-            /**/ if (value == "none")       { params.load_mode = LLAMA_LOAD_MODE_NONE;       }
-            else if (value == "mmap")       { params.load_mode = LLAMA_LOAD_MODE_MMAP;       }
-            else if (value == "mlock")      { params.load_mode = LLAMA_LOAD_MODE_MLOCK;      }
-            else if (value == "mmap+mlock") { params.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK; }
-            else if (value == "dio")        { params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;  }
+            /**/ if (value == "none")  { params.load_mode = LLAMA_LOAD_MODE_NONE;      }
+            else if (value == "mmap")  { params.load_mode = LLAMA_LOAD_MODE_MMAP;      }
+            else if (value == "mlock") { params.load_mode = LLAMA_LOAD_MODE_MLOCK;     }
+            else if (value == "dio")   { params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO; }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_LOAD_MODE"));
@@ -2722,11 +2720,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-moe-res", "--moe-expert-residency"},
         {"-nmoe-res", "--no-moe-expert-residency"},
         string_format("enable MoE expert residency tracking (reduces physical memory pressure of MoE models via madvise). "
-                      "Requires --mmap. (default: %s)", params.moe_expert_residency ? "enabled" : "disabled"),
+                      "Requires --load-mode mmap. (default: %s)", params.moe_expert_residency ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.moe_expert_residency = value;
-            if (value && !params.use_mmap) {
-                fprintf(stderr, "warning: --moe-expert-residency requires --mmap; ignoring\n");
+            if (value && params.load_mode != LLAMA_LOAD_MODE_MMAP) {
+                fprintf(stderr, "warning: --moe-expert-residency requires --load-mode mmap; ignoring\n");
                 params.moe_expert_residency = false;
             }
         }
