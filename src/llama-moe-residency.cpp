@@ -207,8 +207,18 @@ void llama_moe_residency_touch(
         if (evicted_id >= 0 && evicted_id < (int) lr.slot_of.size()) {
             lr.slot_of[evicted_id] = -1;
             const size_t eoff = (size_t) evicted_id;
+            // MADV_FREE (not MADV_DONTNEED): the kernel can drop these
+            // pages if it needs the memory but is free to keep them
+            // resident otherwise. MADV_DONTNEED forced the kernel to
+            // evict immediately, which on memory-constrained systems
+            // (Flip: 8 GB OS-only RAM, 32 GB physical) turned every
+            // cold miss into a disk page-fault and dropped prompt eval
+            // from ~215 t/s to ~56 t/s on Qwen3.6-35B-A3B Q4_K_XL
+            // (3.8x regression, root-caused 2026-07-27). With
+            // MADV_FREE the kernel LRU + memory pressure decide
+            // eviction; pages stay hot while memory is available.
             for_each_tensor(lr, [&](void * base, size_t stride) {
-                safe_madvise((uint8_t *) base + eoff * stride, stride, MADV_DONTNEED);
+                safe_madvise((uint8_t *) base + eoff * stride, stride, MADV_FREE);
             });
             st->total_evicted++;
         }

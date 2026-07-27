@@ -4545,7 +4545,7 @@ void llama_expert_last_selected_clear(struct llama_context * ctx) {
 struct llama_moe_residency_config llama_moe_residency_config_default(void) {
     struct llama_moe_residency_config cfg = {};
     cfg.enabled                = 0;
-    cfg.max_resident_per_layer = 16;
+    cfg.max_resident_per_layer = 64;
     cfg.prewarm_on_init        = 1;
     cfg.prewarm_top_k          = 8;
     cfg.log_per_decode         = 1;
