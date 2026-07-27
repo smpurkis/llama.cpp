@@ -1393,7 +1393,13 @@ private:
             slot.n_ctx   = n_ctx_slot;
 
             slot.mctx                   = mctx;
-            slot.prompt.tokens.has_mtmd = mctx != nullptr;
+            // has_mtmd is set automatically when IMAGE/AUDIO chunks are pushed
+            // to slot.prompt.tokens via push_back() (and to task.tokens via
+            // process_mtmd_prompt's chunked constructor). Do NOT pre-flag
+            // based on the model being multimodal: a multimodal model
+            // routinely serves pure-text slots, and conflating capability with
+            // content makes get_tokens()/context-shift/cache-reuse assert on
+            // otherwise valid text-only requests. See issue #11.
 
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
@@ -3431,7 +3437,11 @@ private:
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
                 {
-                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                    // Gate on actual slot content (has_media) rather than the
+                    // model capability flag (has_mtmd): context shift is only
+                    // safe when there are no image/audio tokens in the slot's
+                    // prompt. See issue #11.
+                    GGML_ASSERT(!slot.prompt.tokens.has_media());
 
                     llama_tokens new_tokens = slot.prompt.tokens.get_tokens(); // copy
                     for (size_t i = n_keep + n_discard; i < new_tokens.size(); i++) {
@@ -3864,7 +3874,12 @@ private:
 
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    // KV-cache reuse via shifting is only safe
+                                    // for slots with no image/audio tokens.
+                                    // has_media() reflects actual slot content;
+                                    // has_mtmd() can also be true on a pure-text
+                                    // slot on a multimodal model (issue #11).
+                                    !slot.prompt.tokens.has_media();
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
@@ -3872,7 +3887,8 @@ private:
 
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
                                 if (can_cache_reuse && n_cache_reuse > 0) {
-                                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                                    // See comment above (issue #11).
+                                    GGML_ASSERT(!slot.prompt.tokens.has_media());
 
                                     size_t head_c = n_past; // cache
                                     size_t head_p = n_past; // current prompt

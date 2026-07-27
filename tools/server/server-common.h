@@ -218,6 +218,11 @@ public:
     bool has_media() const { return !map_idx_to_media.empty(); }
 
     void clear() {
+        // also reset the has_mtmd flag so a cleared container is recognised as
+        // a plain text container. Without this, a slot whose prompt was reset
+        // after a previous media turn would still report has_mtmd=true and
+        // cause text-only operations to assert (issue #11).
+        has_mtmd = false;
         map_idx_to_media.clear();
         tokens.clear();
     }
