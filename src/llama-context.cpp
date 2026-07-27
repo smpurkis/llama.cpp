@@ -4545,7 +4545,13 @@ void llama_expert_last_selected_clear(struct llama_context * ctx) {
 struct llama_moe_residency_config llama_moe_residency_config_default(void) {
     struct llama_moe_residency_config cfg = {};
     cfg.enabled                = 0;
-    cfg.max_resident_per_layer = 64;
+    // Per-layer hot expert slots. 128 covers the observed working set on
+    // Qwen3.6-35B-A3B (256 experts/layer, 8 used/token) where the L+R
+    // scoring stabilizes around 90-120 hot experts during long sessions.
+    // Bumped from 64 (2026-07-27) which dropped to 40% hit rate as the
+    // working set grew beyond the cache. RAM cost: ~10 GiB resident on
+    // 40-layer MoE, still well under standard tier budget.
+    cfg.max_resident_per_layer = 128;
     cfg.prewarm_on_init        = 1;
     cfg.prewarm_top_k          = 8;
     cfg.log_per_decode         = 1;
