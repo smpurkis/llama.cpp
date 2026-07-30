@@ -5,23 +5,34 @@ set -euo pipefail
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ROCM_PATH=${ROCM_PATH:-/opt/rocm-7.2.4}
 JOBS=${JOBS:-$(nproc)}
-TARGET=${TARGET:-llama-cli}
+TARGET=${TARGET:-"llama-cli llama-server"}
 
 usage() {
     printf 'Usage: %s [all|rocm|vulkan|rocwmma]...\n' "${0##*/}"
-    printf 'Environment: ROCM_PATH, JOBS, TARGET (default: llama-cli)\n'
+    printf 'Default variant: rocm (output: build/)\n'
+    printf 'Environment: ROCM_PATH, JOBS, TARGET (default: "llama-cli llama-server")\n'
 }
 
 configure_and_build() {
     local name=$1
+    local build_dir="$ROOT_DIR/build-$name"
+    local targets
     shift
 
-    printf '\n==> Building %s in build-%s\n' "$name" "$name"
-    cmake -S "$ROOT_DIR" -B "$ROOT_DIR/build-$name" \
+    if [[ "$name" == "rocm" ]]; then
+        build_dir="$ROOT_DIR/build"
+    fi
+
+    read -r -a targets <<< "$TARGET"
+
+    printf '\n==> Building %s in %s\n' "$name" "${build_dir#"$ROOT_DIR"/}"
+    cmake -S "$ROOT_DIR" -B "$build_dir" \
         -DCMAKE_BUILD_TYPE=Release \
         -DLLAMA_CURL=OFF \
         "$@"
-    cmake --build "$ROOT_DIR/build-$name" --config Release --target "$TARGET" -- -j "$JOBS"
+    cmake --build "$build_dir" --config Release --target "${targets[@]}" -- -j "$JOBS"
+
+    printf 'Built binaries are in %s/bin\n' "$build_dir"
 }
 
 build_rocm() {
@@ -59,7 +70,7 @@ if [[ ${1:-all} == "--help" || ${1:-all} == "-h" ]]; then
     exit 0
 fi
 
-variants=("${@:-all}")
+variants=("${@:-rocm}")
 for variant in "${variants[@]}"; do
     case "$variant" in
         all)
@@ -77,5 +88,4 @@ for variant in "${variants[@]}"; do
     esac
 done
 
-printf '\nBuild complete. For Strix Halo HIP runs, set:\n'
-printf '  GGML_CUDA_ENABLE_UNIFIED_MEMORY=1\n'
+printf '\nBuild complete. Do not set GGML_CUDA_ENABLE_UNIFIED_MEMORY for DeepSeek V4 Flash; it corrupts output on gfx1151.\n'
