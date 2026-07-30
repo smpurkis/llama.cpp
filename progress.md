@@ -657,3 +657,54 @@ selects the right path at each depth.
 | CPU ISA auto-detection for Vulkan builds | CPU-side, not ROCm |
 | GTT/VRAM BIOS partitioning | System-level, not backend-specific |
 | `posix_fadvise` readahead for SSD | General, already on halo |
+
+## Rebase summary (2026-07-30T15:16:02Z)
+
+- New upstream commits: 81
+- New CachyLLama commits: 47
+- Halo unique commits: 55
+- Build: not run
+
+### New upstream commits
+56a83860d opencl: do not treat NULL-mask flash attention as causal (#25771)
+ed7adbfef opencl: cache compiled cl_program binaries on disk (#26050)
+fa72aeccb HIP: remove rocWMMA FlashAttention (#26046)
+298219f98 llama: various bug fixes (#26051)
+27209a598 server: support "reasoning_effort": "none" in OAI API (#26045)
+95a923a64 ui: fix MCP server display name conflicts in tools lists (#26011)
+88bfee142 model: add GLM 5.2 Indexer support (#25407)
+96013c511 ui: remove render effects (#26083)
+555881ebc ui: reduce per-token render cost when streaming  (#26053)
+d67c0b410 tests: synchronize save-load-state generation (#26056)
+910196f6b common : add support for multiple end sequences in the reasoning budget sampler (#25544)
+fb92d8f18 Update ggml/src/gguf.cpp : Defined virtual keyword for destructor of gguf_writer_base (#25867)
+720d7fa40 vendor : update cpp-httplib to 0.51.0 (#26067)
+2cfc7670e server : add missing task parameters(adaptive_target, adaptive_decay) in generation_settings (#25830)
+abc348790 server: add format arg to datetime tool (#26117)
+c812c543f common : skip empty implicit default preset (#25643)
+355303eda hexagon: partial im2col support (#26007)
+20455a4ad server: support MCP stdio (#26062)
+8bb909374 common : use-after-free when loading LoRA adapter fails (#25611)
+7cdd557f7 ggml-webgpu: Fix WASM compilation with OpenMP (#25943)
+
+### New CachyLLama commits
+e8e6c7af2 minor: fix reasoning preserve var for DS4 [no ci] (#25999)
+61328e6a9 feat(ui): add symbolic math support to JS sandbox via nerdamer (#25948)
+e0833bf68 mtmd: use RAII for setting and resetting non-causal attention (#25723)
+0278d8362 hexagon: activation ops update (#25974)
+1a064ab09 CUDA: Improve NVFP4 W4A4 activation quantization (#25730)
+cf512566d ui: Add a "Default" option for the reasoning selector (#25846)
+4310aa4f8 contrib: allow all AI-generated code in general (#26012)
+d941f6e1c conversion: fix non-MoE NomicBert GGUF conversion error (#25996)
+c588c4f47 metal : add f16 type support to leaky relu (#25981)
+da296d6e7 contrib: fix leftovers from the AI usage policy update (#26030)
+e6dd0e29a args: refactor mlock/mmap/directio into load-mode (#20834)
+1425386fd CUDA: fix external compilation of q1_0 MMQ (#25778)
+c0bc8591e hexagon: fix Windows crash when op_poll is enabled (#26029)
+0a50d9909 hexagon: further improved pipeline of the core bits (L2, DMA, MM, FA) (#26049)
+0cea36222 vendor: update subprocess.h (#26061)
+8f5ab832c cohere2 moe template parser: enforce JSON schema for text responses if a response schema is provided (#26018)
+54ce507b6 UI: Fix settings precedence, Factory < Admin (--ui-config-file) < Users (Settings panel) (#26002)
+77095ee0c skill: create `add-new-model` and `code-review` (#26042)
+56a83860d opencl: do not treat NULL-mask flash attention as causal (#25771)
+ed7adbfef opencl: cache compiled cl_program binaries on disk (#26050)
