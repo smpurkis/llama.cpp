@@ -1110,14 +1110,18 @@ uint64_t kv_ssd_find_continuation(
                 else break;
             }
 
-            // Score: how much of the checkpoint's token range is covered
-            // by the matching prefix. Using n_tokens (not token_count) because
-            // n_tokens is the actual checkpoint size - if the LCP covers most
-            // of n_tokens, the checkpoint's recurrent state is mostly valid.
-            // Cap at 1.0 since LCP can exceed n_tokens when the stored prefix
-            // extends beyond the checkpoint's token range.
-            float score = (rec.n_tokens > 0)
-                ? std::min(1.0f, (float)matches / (float)rec.n_tokens)
+            // Score: how much of the checkpoint's prefix is covered by the
+            // matching prefix. Using token_count (bounded by
+            // KV_SSD_TOKEN_PREFIX_MAX) instead of n_tokens ensures that long
+            // checkpoints (n_tokens >> KV_SSD_TOKEN_PREFIX_MAX) are not
+            // penalized - the ratio tops out at 1.0 for any perfect prefix
+            // alignment regardless of how far past the prefix the checkpoint
+            // extends. Without this fix, a checkpoint with n_tokens > 4551
+            // could never reach the default 0.90 min_overlap threshold even
+            // on perfect prefix alignment (4096/8192 = 0.5), making
+            // long-running conversations invisible on server restart.
+            float score = (rec.token_count > 0)
+                ? std::min(1.0f, (float)matches / (float)rec.token_count)
                 : 0.0f;
             if (score > best_conv_score) best_conv_score = score;
         }

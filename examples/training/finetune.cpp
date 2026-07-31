@@ -26,9 +26,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (params.load_mode != LLAMA_LOAD_MODE_NONE) {
-        LOG_INF("%s: forcing load_mode = none to enable writable pointers to the weights\n", __func__);
-        params.load_mode = LLAMA_LOAD_MODE_NONE;
+    if (params.use_mmap || params.use_mlock) {
+        LOG_INF("%s: disabling mmap/mlock to enable writable pointers to the weights\n", __func__);
+        params.use_mmap = false;
+        params.use_mlock = false;
     }
     if (params.cache_type_k != GGML_TYPE_F32) {
         LOG_INF("%s: force changing k cache type to f32 due to a lack of f16 support for OUT_PROD\n", __func__);

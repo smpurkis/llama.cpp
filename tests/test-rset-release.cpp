@@ -28,7 +28,9 @@ int main(int argc, char ** argv) {
     const uint64_t wired_initial = wired_memory();
 
     llama_model_params params = llama_model_default_params();
-    params.load_mode = LLAMA_LOAD_MODE_NONE;
+    params.use_mmap = false;
+    params.use_direct_io = false;
+    params.use_mlock = false;
     struct llama_model* model = llama_model_load_from_file(model_path, params);
 
     const uint64_t wired_loaded = wired_memory();

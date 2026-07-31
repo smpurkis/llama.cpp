@@ -1220,9 +1220,35 @@ struct cmd_params_instance {
         if (!devices.empty()) {
             mparams.devices = const_cast<ggml_backend_dev_t *>(devices.data());
         }
-        mparams.split_mode    = split_mode;
-        mparams.load_mode     = load_mode;
-        mparams.main_gpu      = main_gpu;
+        mparams.split_mode = split_mode;
+        switch (load_mode) {
+            case LLAMA_LOAD_MODE_NONE:
+                mparams.use_mmap = false;
+                mparams.use_mlock = false;
+                mparams.use_direct_io = false;
+                break;
+            case LLAMA_LOAD_MODE_MMAP:
+                mparams.use_mmap = true;
+                mparams.use_mlock = false;
+                mparams.use_direct_io = false;
+                break;
+            case LLAMA_LOAD_MODE_MLOCK:
+                mparams.use_mmap = false;
+                mparams.use_mlock = true;
+                mparams.use_direct_io = false;
+                break;
+            case LLAMA_LOAD_MODE_MMAP_MLOCK:
+                mparams.use_mmap = true;
+                mparams.use_mlock = true;
+                mparams.use_direct_io = false;
+                break;
+            case LLAMA_LOAD_MODE_DIRECT_IO:
+                mparams.use_mmap = false;
+                mparams.use_mlock = false;
+                mparams.use_direct_io = true;
+                break;
+        }
+        mparams.main_gpu = main_gpu;
         mparams.tensor_split  = tensor_split.data();
         mparams.no_host       = no_host;
 
